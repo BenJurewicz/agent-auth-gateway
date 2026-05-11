@@ -1,0 +1,43 @@
+# Auth Proxy Configuration
+# Copy to config.yaml and fill in your values.
+
+server:
+  host: "0.0.0.0"
+  port: 8443
+
+api:
+  # Shared secret between the AI agent and this proxy.
+  # Can also be set via AUTH_PROXY_TOKEN env var (takes precedence).
+  auth_token: "change-me-to-a-long-random-string"
+
+telegram:
+  # Bot token from @BotFather on Telegram.
+  # Can also be set via AUTH_PROXY_TELEGRAM env var (takes precedence).
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+
+  # List of Telegram user IDs allowed to approve/deny requests.
+  # Get your user ID by messaging @userinfobot on Telegram.
+  allowed_user_ids:
+    - 123456789
+
+approval:
+  # Mode: "telegram" (send via Telegram), "console" (stdin), "auto" (no approval)
+  mode: "telegram"
+  # Timeout for user to approve (seconds)
+  timeout: 300
+
+services:
+  # ── Git / GitHub ──────────────────────────────────────────────────────
+  git:
+    enabled: true
+    # Path to the SSH private key that has access to GitHub.
+    # The proxy holds this key — it never leaves this machine.
+    ssh_key_path: "~/.ssh/id_ed25519"
+    # Timeout for individual git commands (seconds)
+    timeout: 120
+
+  # ── Google Calendar (future) ──────────────────────────────────────────
+  # calendar:
+  #   enabled: false
+  #   sa_key_path: "~/.auth-proxy/secrets/calendar-sa-key.json"
+  #   calendar_id: "your-calendar-id@group.calendar.google.com"
