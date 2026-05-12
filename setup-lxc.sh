@@ -74,7 +74,6 @@ Group=root
 
 # Security hardening
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
 CapabilityBoundingSet=

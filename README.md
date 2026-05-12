@@ -2,14 +2,14 @@
 
 A secure credential gate that sits between an AI agent and any service that needs
 authentication. Holds all credentials (SSH keys, API tokens, service account keys)
-on a Proxmox LXC container and requires explicit Telegram approval before every
+on a dedicated machine and requires explicit Telegram approval before every
 privileged operation.
 
 ## Architecture
 
 ```
  ┌─────────────────────────┐   POST /gate/{svc}/{act}   ┌──────────────────────────┐
- │   AI Agent (remote VM)  │ ─────────────────────────▶  │ Auth Proxy (Proxmox LXC) │
+ │   AI Agent (remote VM)  │ ─────────────────────────▶  │  Auth Proxy (gate host)  │
  │                         │                            │                          │
  │  - Has no credentials   │  ◀────────────────────────  │  - Holds ALL credentials │
  │  - Delegates to proxy   │   {success, output, ...}   │  - Service plugin system │
@@ -22,15 +22,15 @@ privileged operation.
                                                     │  "git push to repo/main?     │
                                                     │   [✅ Approve]  [❌ Deny]    │
                                                     │                              │
-                                                    │        the user              │
+                                                    │       Authorized User        │
                                                     └──────────────────────────────┘
 ```
 
 **Key security properties:**
 
-- Credentials **never leave** the Proxmox machine.
+- Credentials **never leave** the gate machine.
 - The AI agent cannot bypass approval — it doesn't have the keys.
-- Each operation shows the user enough context to make a decision.
+- Each operation shows enough context to make an informed decision.
 - Adding a new service is a single file: subclass `BaseService`, add `@service("name")`.
 
 ## Supported Services
@@ -73,91 +73,135 @@ class MyService(BaseService):
 
 The service is auto-discovered via the `@service` decorator. No other registration needed.
 
-## Deployment (Proxmox LXC)
+## Deployment
+
+The proxy runs on a dedicated machine (Proxmox LXC, dedicated VM, Raspberry Pi, etc.)
+with Debian 12 or Ubuntu 22.04+.
 
 ### Prerequisites
 
-- Proxmox VE 7.x or 8.x
-- LXC template: Ubuntu 22.04+ or Debian 12+
-- GitHub SSH key for the user
-- Telegram bot token (from [@BotFather](https://t.me/BotFather))
+- Debian 12 or Ubuntu 22.04+ machine (1 CPU core, 512 MB RAM is plenty)
+- Internet access (for pip packages and Telegram API)
+- A Telegram bot token from [@BotFather](https://t.me/BotFather)
+- Your Telegram user ID from [@userinfobot](https://t.me/userinfobot)
+- (For git service) An SSH deploy key with access to your repositories
 
 ### Quick Setup
 
 ```bash
-# 1. Inside your LXC container, as root:
+# 1. Install system dependencies
+apt update && apt install -y python3 python3-pip python3-venv git openssh-client curl
+
+# 2. Clone the repo and set up venv
 cd /opt
-git clone <this-repo> auth-proxy
-cd auth-proxy
-bash setup-lxc.sh
+git clone https://github.com/BenJurewicz/agent-auth-gateway.git
+cd agent-auth-gateway
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
 
-# 2. Edit the configuration:
-nano /opt/auth-proxy/config.yaml
-
-# 3. Add SSH key for GitHub:
-cp /path/to/id_ed25519 /root/.ssh/id_ed25519
-chmod 600 /root/.ssh/id_ed25519
-
-# 4. Test SSH access (accept GitHub's host key):
-ssh -T git@github.com
-
-# 5. Start the service:
-systemctl start auth-proxy
-systemctl status auth-proxy
+# 3. Configure
+cp config.yaml.example config.yaml
+nano config.yaml
 ```
 
-### Manual Setup
+Required config fields:
+
+```yaml
+api:
+  auth_token: "generate-a-random-string"    # Shared secret with the AI agent
+
+telegram:
+  bot_token: "1234567890:ABC-DEF..."        # From @BotFather
+  allowed_user_ids:                          # From @userinfobot
+    - 123456789
+
+services:
+  git:
+    ssh_key_path: "~/.ssh/id_ed25519"       # Deploy key to access repos
+```
 
 ```bash
-# Install dependencies
-apt update && apt install -y python3 python3-pip python3-venv git openssh-client
-python3 -m venv /opt/auth-proxy/venv
-source /opt/auth-proxy/venv/bin/activate
-pip install fastapi uvicorn[standard] pyyaml python-telegram-bot pydantic
+# 4. Add an SSH deploy key
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N ""
+cat ~/.ssh/id_ed25519.pub
+# Add the public key to your GitHub account or repo deploy keys
 
-# Copy files
-mkdir -p /opt/auth-proxy/services
-cp auth-proxy-server.py /opt/auth-proxy/
-cp -r services/ /opt/auth-proxy/
-cp config.yaml.example /opt/auth-proxy/config.yaml
-find /opt/auth-proxy -name "*.py" -exec chmod +x {} \;
+# Accept GitHub's host key
+ssh -o StrictHostKeyChecking=accept-new -T git@github.com
 
-# Configure
-nano /opt/auth-proxy/config.yaml
-
-# Add SSH key
-cp ~/.ssh/id_ed25519 /root/.ssh/id_ed25519
-chmod 600 /root/.ssh/id_ed25519
-
-# Create systemd service and start
-cp setup-lxc.sh /opt/auth-proxy/  # or paste the service manually
-systemctl enable --now auth-proxy
+# 5. Start the server (foreground test)
+source venv/bin/activate
+AUTH_PROXY_TOKEN="your-secret" python auth-proxy-server.py
 ```
 
-### Systemd Service (from setup-lxc.sh)
+### Testing
 
-```ini
+The server starts on port 8443 by default. Test it from another terminal:
+
+```bash
+# Console approval mode (for testing, no Telegram needed)
+nano config.yaml  # set approval.mode: console
+
+# Restart the server, then:
+python auth-proxy-client.py --proxy-url http://localhost:8443 \
+  --auth-token "your-secret" health
+
+# Test a git clone via proxy
+mkdir -p /tmp/test-proxy
+python auth-proxy-client.py --proxy-url http://localhost:8443 \
+  --auth-token "your-secret" gate git clone \
+  --param repo=git@github.com:github/gitignore.git \
+  --param target-dir=/tmp/test-proxy/gitignore \
+  --details "Testing the proxy"
+```
+
+After approving in the server console, verify the clone:
+
+```bash
+ls /tmp/test-proxy/gitignore/
+```
+
+### Systemd Service (Production)
+
+```bash
+# Edit config back to telegram mode
+nano config.yaml  # set approval.mode: telegram
+
+# Stop the foreground server (Ctrl+C) and create the service
+cat > /etc/systemd/system/agent-auth-gateway.service << 'SERVICE'
 [Unit]
-Description=Auth Proxy — Secure credential gate with Telegram approval
+Description=Agent Auth Gateway — credential gate with Telegram approval
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/auth-proxy/venv/bin/python /opt/auth-proxy/auth-proxy-server.py
-WorkingDirectory=/opt/auth-proxy
+ExecStart=/opt/agent-auth-gateway/venv/bin/python /opt/agent-auth-gateway/auth-proxy-server.py
+WorkingDirectory=/opt/agent-auth-gateway
 Restart=on-failure
 RestartSec=5
 User=root
 Group=root
 NoNewPrivileges=yes
-PrivateTmp=yes
 ProtectSystem=full
 ProtectHome=read-only
 
 [Install]
 WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable --now agent-auth-gateway
+systemctl status agent-auth-gateway
+
+# View logs
+journalctl -u agent-auth-gateway -f
 ```
+
+> **Note:** `PrivateTmp=yes` is intentionally omitted from the service unit.
+> It isolates `/tmp` and causes git clone targets to land in a private namespace
+> invisible to the client. The agent needs to see the cloned output.
 
 ## Configuration
 
@@ -313,7 +357,7 @@ When the AI agent sends an operation:
    - For git: current branch, recent commits, unpushed changes
    - Custom details from the agent
 
-2. **the user taps** ✅ Approve or ❌ Deny
+2. **The user taps** ✅ Approve or ❌ Deny
 
 3. **If approved:** the proxy executes the operation with the stored credential.
    **If denied:** the agent gets an error response.
