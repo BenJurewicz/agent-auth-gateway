@@ -34,11 +34,14 @@ import uvicorn
 
 try:
     from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+    from telegram.error import BadRequest as TelegramBadRequest
     from telegram.ext import Application, CallbackQueryHandler, ContextTypes
     from telegram.constants import ParseMode as TGParseMode
     TELEGRAM_AVAILABLE = True
 except ImportError:
     TELEGRAM_AVAILABLE = False
+    class TelegramBadRequest(Exception):
+        pass
     class TGParseMode:
         MARKDOWN = "Markdown"
 
@@ -221,6 +224,14 @@ async def send_approval(req: PendingRequest) -> None:
     log.info("Approval %s sent to %d user(s)", req.id[:16], sent)
 
 
+async def _safe_edit(query, text: str, **kwargs) -> None:
+    """Edit message text, silently ignoring duplicate edits."""
+    try:
+        await query.edit_message_text(text=text, **kwargs)
+    except TelegramBadRequest:
+        pass
+
+
 async def handle_tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -238,26 +249,26 @@ async def handle_tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
     allowed = config.get("telegram", {}).get("allowed_user_ids", [])
 
     if allowed and uid not in allowed:
-        await query.edit_message_text("⛔ You are not authorized to approve requests.")
+        await _safe_edit(query, "⛔ You are not authorized to approve requests.")
         return
 
     req = await request_store.get(req_id)
     if not req or req.event.is_set():
-        await query.edit_message_text("⌛ This request has already been processed or expired.")
+        await _safe_edit(query, "⌛ This request has already been processed or expired.")
         return
 
     name = f"@{user.username}" if user and user.username else (user.first_name or "Unknown")
 
     if action == "ap":
         req.approve()
-        await query.edit_message_text(
+        await _safe_edit(query,
             text=query.message.text + f"\n\n✅ *Approved by* {name}",
             parse_mode=TGParseMode.MARKDOWN, reply_markup=None,
         )
         log.info("Request %s APPROVED by %s", req_id[:16], uid)
     else:
         req.deny()
-        await query.edit_message_text(
+        await _safe_edit(query,
             text=query.message.text + f"\n\n❌ *Denied by* {name}",
             parse_mode=TGParseMode.MARKDOWN, reply_markup=None,
         )
