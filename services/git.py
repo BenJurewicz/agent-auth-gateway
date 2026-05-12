@@ -178,8 +178,9 @@ class GitService(BaseService):
             return {"success": False, "output": f"Failed to prepare cache: {e}", "exit_code": -1}
 
         # 2. Determine what to put in the bundle
-        ref_spec = f"origin/{branch}"
-        bundle_ref = f"refs/heads/{branch}"
+        # Use the bare cache's local branch (refs/heads/<branch>) so the
+        # client can fetch it as a source ref regardless of remote tracking setup.
+        ref_spec = f"refs/heads/{branch}"
 
         use_delta = bool(known_ref)
         if use_delta:
