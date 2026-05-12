@@ -64,7 +64,16 @@ class BaseService:
         """Optional: return additional context for the approval prompt."""
         return ""
 
+    @classmethod
+    def requires_approval(cls, action: str) -> bool:
+        """Whether this action requires user approval.
+
+        Override to return False for read-only or non-destructive actions.
+        """
+        return True
+
 
 # Import services so they register themselves
 from . import git       # noqa: E402, F811
+from . import github    # noqa: E402, F811
 # from . import calendar  # future — uncomment when implemented

@@ -11,6 +11,9 @@ Endpoints:
   POST /gate/pull/{service}/{action} — Binary stream response (for bundle downloads)
   GET  /health                       — Health check
 
+Services may skip Telegram approval for specific actions (e.g. read-only
+lookups) by overriding ``requires_approval(action) -> bool``.
+
 Extensible via service plugins in services/*.py.
 
 Usage:
@@ -342,7 +345,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Auth Proxy",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan,
     docs_url="/docs" if os.environ.get("AUTH_PROXY_DEBUG") else None,
     redoc_url=None,
@@ -424,8 +427,14 @@ async def _run_gate_flow(
     req = PendingRequest(service, action, req_data)
     await request_store.add(req)
 
-    # ── Send approval ───────────────────────────────────────────────────
-    if use_telegram:
+    # Check if this action requires approval
+    needs_approval = svc.requires_approval(action)
+
+    # ── Send approval (or skip) ────────────────────────────────────────
+    if not needs_approval:
+        log.info("Action %s/%s does not require approval — executing directly", service, action)
+        req.approve()
+    elif use_telegram:
         try:
             await send_approval(req)
         except Exception as e:

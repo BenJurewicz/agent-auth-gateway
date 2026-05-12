@@ -25,6 +25,20 @@ Usage as CLI:
 
     python auth-proxy-client.py health
 
+    # GitHub — list repos (no approval needed)
+    python auth-proxy-client.py github-list-repos --filter agent-auth
+    python auth-proxy-client.py github-list-repos
+
+    # GitHub — create repo (requires Telegram approval)
+    python auth-proxy-client.py github-create-repo --name my-project \
+        --description "My new project" --auto-init --details "For the new feature"
+
+    # GitHub — create PR (requires Telegram approval)
+    python auth-proxy-client.py github-create-pr \
+        --owner BenJurewicz --repo my-repo \
+        --title "Add feature" --head feature-branch --base main \
+        --body "Implements the requested feature" --details "Feature PR"
+
 Usage as library:
     from auth_proxy_client import AuthProxyClient
 
@@ -38,9 +52,11 @@ Usage as library:
     proxy.git_push_bundle(repo="git@github.com:user/repo.git", workdir="/path",
                           branch="main", details="My update")
 
-    # Legacy proxy-executed ops
-    result = proxy.git_push(repo="git@github.com:user/repo.git", workdir="/path", branch="main")
-    result = proxy.git_clone(repo="git@github.com:user/repo.git", target_dir="/path")
+    # GitHub API (no git involved)
+    result = proxy.github_list_repos(filter="agent-auth")
+    result = proxy.github_create_repo(name="new-project", private=True, details="For X")
+    result = proxy.github_create_pr(owner="BenJurewicz", repo="my-repo",
+                                    title="Fix bug", head="fix", base="main")
 
     print(proxy.health())
 """
@@ -397,6 +413,96 @@ class AuthProxyClient:
             "bundle_b64": b64,
         }, details)
 
+    # ── GitHub service ─────────────────────────────────────────────────
+
+    def github_list_repos(
+        self,
+        filter: str = "",
+        per_page: int = 100,
+        page: int = 1,
+        details: str = "",
+    ) -> dict:
+        """List GitHub repositories visible to the token.
+
+        Args:
+            filter: Optional name filter (case-insensitive substring match).
+            per_page: Results per page (max 100).
+            page: Page number.
+            details: Human-readable context.
+
+        Returns:
+            Dict with keys: success, output, repos (list of structured repo data), count.
+        """
+        return self._gate("github", "list-repos", {
+            "filter": filter,
+            "per_page": str(per_page),
+            "page": str(page),
+        }, details)
+
+    def github_create_repo(
+        self,
+        name: str,
+        private: bool = True,
+        description: str = "",
+        auto_init: bool = False,
+        details: str = "",
+    ) -> dict:
+        """Create a new GitHub repository.
+
+        Args:
+            name: Repository name.
+            private: Whether the repo should be private (requires 'repo' scope token).
+            description: Optional description.
+            auto_init: Whether to initialize with a README.
+            details: Human-readable context for approval prompt.
+
+        Returns:
+            Dict with keys: success, output, html_url, ssh_url, name.
+        """
+        if not details:
+            details = f"Create {'private' if private else 'public'} repo: {name}"
+        return self._gate("github", "create-repo", {
+            "name": name,
+            "private": str(private).lower(),
+            "description": description,
+            "auto_init": str(auto_init).lower(),
+        }, details)
+
+    def github_create_pr(
+        self,
+        owner: str,
+        repo: str,
+        title: str,
+        head: str,
+        base: str = "main",
+        body: str = "",
+        details: str = "",
+    ) -> dict:
+        """Create a pull request on GitHub.
+
+        Args:
+            owner: Repository owner (user or org).
+            repo: Repository name.
+            title: PR title.
+            head: Source branch (the branch with changes).
+            base: Target branch (usually 'main').
+            body: PR description body.
+            details: Human-readable context for approval prompt.
+
+        Returns:
+            Dict with keys: success, output, pr_number, html_url, title.
+        """
+        if not details:
+            details = f"Create PR: {owner}/{repo}  {head} → {base}: {title}"
+        return self._gate("github", "create-pr", {
+            "owner": owner,
+            "repo": repo,
+            "title": title,
+            "head": head,
+            "base": base,
+            "body": body,
+        }, details)
+
     # ── Generic gate ────────────────────────────────────────────────────
 
     def gate(self, service: str, action: str, params: dict, details: str = "") -> dict:
@@ -472,6 +578,39 @@ def cli() -> None:
     p_push.add_argument("--details", "-d", default="", help="Human-readable context")
     p_push.add_argument("--timeout", type=int, default=0,
                         help="Override request timeout in seconds")
+
+    # ── github list-repos ──────────────────────────────────────────────
+    p_gh_list = sub.add_parser("github-list-repos",
+        help="List GitHub repositories (no approval needed)")
+    p_gh_list.add_argument("--filter", default="",
+        help="Filter repos by name (case-insensitive substring)")
+    p_gh_list.add_argument("--per-page", type=int, default=100, help="Results per page")
+    p_gh_list.add_argument("--page", type=int, default=1, help="Page number")
+
+    # ── github create-repo ─────────────────────────────────────────────
+    p_gh_create = sub.add_parser("github-create-repo",
+        help="Create a GitHub repository (requires approval)")
+    p_gh_create.add_argument("--name", required=True, help="Repository name")
+    p_gh_create.add_argument("--public", action="store_true",
+        help="Make the repository public (default: private)")
+    p_gh_create.add_argument("--description", default="",
+        help="Repository description")
+    p_gh_create.add_argument("--auto-init", action="store_true",
+        help="Initialize with README")
+    p_gh_create.add_argument("--details", "-d", default="",
+        help="Human-readable context for approval prompt")
+
+    # ── github create-pr ───────────────────────────────────────────────
+    p_gh_pr = sub.add_parser("github-create-pr",
+        help="Create a pull request (requires approval)")
+    p_gh_pr.add_argument("--owner", required=True, help="Repository owner (user or org)")
+    p_gh_pr.add_argument("--repo", required=True, help="Repository name")
+    p_gh_pr.add_argument("--title", required=True, help="PR title")
+    p_gh_pr.add_argument("--head", required=True, help="Source branch (head)")
+    p_gh_pr.add_argument("--base", default="main", help="Target branch (base, default: main)")
+    p_gh_pr.add_argument("--body", default="", help="PR description body")
+    p_gh_pr.add_argument("--details", "-d", default="",
+        help="Human-readable context for approval prompt")
 
     # ── health ──────────────────────────────────────────────────────────
     sub.add_parser("health", help="Check proxy health")
@@ -549,6 +688,51 @@ def cli() -> None:
             workdir=args.workdir,
             branch=args.branch,
             details=args.details,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── github-list-repos ──────────────────────────────────────────────
+    elif args.command == "github-list-repos":
+        result = client.github_list_repos(
+            filter=args.filter,
+            per_page=args.per_page,
+            page=args.page,
+        )
+        if "repos" in result and result["repos"]:
+            print(f"Found {result['count']} repo(s):\n")
+            for r in result["repos"]:
+                vis = "🔒" if r["private"] else "🌐"
+                desc = f" — {r['description']}" if r.get("description") else ""
+                print(f"  {vis} {r['name']}{desc}")
+            print()
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        else:
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── github-create-repo ─────────────────────────────────────────────
+    elif args.command == "github-create-repo":
+        result = client.github_create_repo(
+            name=args.name,
+            private=not args.public,
+            description=args.description,
+            auto_init=args.auto_init,
+            details=args.details or f"Create repo: {args.name}",
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── github-create-pr ───────────────────────────────────────────────
+    elif args.command == "github-create-pr":
+        result = client.github_create_pr(
+            owner=args.owner,
+            repo=args.repo,
+            title=args.title,
+            head=args.head,
+            base=args.base,
+            body=args.body,
+            details=args.details or f"PR: {args.title}",
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)

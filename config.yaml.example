@@ -36,6 +36,17 @@ services:
     # Timeout for individual git commands (seconds)
     timeout: 120
 
+  # ── GitHub API ────────────────────────────────────────────────────────
+  github:
+    enabled: true
+    # GitHub Personal Access Token (classic or fine-grained) with scopes:
+    #   - repo (full control of private repos)
+    #   - public_repo (for public repo operations)
+    # The proxy holds this token — the client never sees it.
+    token: "github_pat_..."
+    # Timeout for individual API calls (seconds)
+    timeout: 30
+
   # ── Google Calendar (future) ──────────────────────────────────────────
   # calendar:
   #   enabled: false
