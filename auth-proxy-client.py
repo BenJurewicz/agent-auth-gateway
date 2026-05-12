@@ -231,16 +231,29 @@ class AuthProxyClient:
                         "target_dir": target_dir,
                     }
 
-                # Rename the bundle-origin to something that won't conflict,
-                # and add the real GitHub URL as 'origin' for reference
+                # Save the bundle's tip SHA before removing the bundle remote
+                bundle_tip = subprocess.run(
+                    ["git", "rev-parse", f"refs/remotes/origin/{branch}"],
+                    cwd=target_dir, capture_output=True, text=True, timeout=10,
+                )
+                tip_sha = bundle_tip.stdout.strip() if bundle_tip.returncode == 0 else ""
+
+                # Remove the bundle-based origin entirely, add the real GitHub URL
                 subprocess.run(
-                    ["git", "remote", "rename", "origin", "bundle-origin"],
+                    ["git", "remote", "remove", "origin"],
                     cwd=target_dir, capture_output=True, timeout=10,
                 )
                 subprocess.run(
                     ["git", "remote", "add", "origin", repo],
                     cwd=target_dir, capture_output=True, timeout=10,
                 )
+
+                # Restore the tracking ref under the new origin
+                if tip_sha:
+                    subprocess.run(
+                        ["git", "update-ref", f"refs/remotes/origin/{branch}", tip_sha],
+                        cwd=target_dir, capture_output=True, timeout=10,
+                    )
 
                 return {
                     "success": True,
@@ -317,22 +330,27 @@ class AuthProxyClient:
             return {"success": False, "output": f"Not a git repo: {workdir}", "exit_code": -1}
 
         # Determine base ref for the bundle (commits not yet in origin/<branch>)
-        base_ref = f"refs/remotes/origin/{branch}"
+        # Try multiple possible remote tracking refs (origin, bundle-origin, then local branch)
+        candidate_refs = [
+            f"refs/remotes/origin/{branch}",
+            f"refs/remotes/bundle-origin/{branch}",
+            f"refs/heads/{branch}",
+        ]
+        base_ref = None
         try:
-            check_base = subprocess.run(
-                ["git", "rev-parse", "--verify", "-q", base_ref],
-                cwd=workdir, capture_output=True, timeout=10,
-            )
-            if check_base.returncode != 0:
-                base_ref = "refs/heads/{branch}"
-                check_base = subprocess.run(
-                    ["git", "rev-parse", "--verify", "-q", base_ref],
+            for ref in candidate_refs:
+                check = subprocess.run(
+                    ["git", "rev-parse", "--verify", "-q", ref],
                     cwd=workdir, capture_output=True, timeout=10,
                 )
-                if check_base.returncode != 0:
-                    return {"success": False, "output": f"Branch '{branch}' not found locally", "exit_code": -1}
+                if check.returncode == 0:
+                    base_ref = ref
+                    break
         except Exception as e:
             return {"success": False, "output": f"Failed to check base ref: {e}", "exit_code": -1}
+
+        if not base_ref:
+            return {"success": False, "output": f"Branch '{branch}' not found locally (tried origin, bundle-origin, and local)", "exit_code": -1}
 
         # Create bundle
         fd, bundle_path = tempfile.mkstemp(suffix=".bundle", prefix="claw-push-")
