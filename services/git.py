@@ -83,13 +83,13 @@ class GitService(BaseService):
         refspec = _sanitize(data.get("refspec", ""))
 
         if action == "clone":
-            target_dir = _sanitize(data.get("target_dir", ""))
+            target_dir = _sanitize(data.get("target_dir", "") or data.get("target-dir", ""))
             cmd = f"git clone --progress {repo}"
             if branch:
                 cmd += f" --branch {branch}"
             if target_dir:
                 cmd += f" {target_dir}"
-            workdir = target_dir or os.getcwd()
+            workdir = "."  # git clone creates the target dir itself
         else:
             workdir = _sanitize(data.get("workdir", ""))
             if action == "push":
