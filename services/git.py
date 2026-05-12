@@ -3,11 +3,22 @@ Git Service — GitHub operations via SSH key.
 
 Holds the user's SSH private key on the proxy. Every git operation
 (push, clone, fetch, pull) requires Telegram approval.
+
+Supports git bundle transport for proxying repo data to/from the client:
+  - fetch-bundle: Clone/fetch repo to bare cache, create a .bundle file of
+    branch contents that the client can download and git-clone/git-fetch from.
+  - push-bundle: Accept a base64-encoded bundle from the client, apply it to
+    the bare cache, and push to origin.
 """
 
+import base64
+import hashlib
 import logging
 import os
+import secrets
 import subprocess
+import tempfile
+import time
 
 from . import BaseService, service
 
@@ -15,6 +26,9 @@ log = logging.getLogger("auth-proxy.git")
 
 # Character blacklist for shell injection prevention
 _FORBIDDEN = set(";&|$`(){}<>\n\r")
+
+# Base cache directory for bare repos
+CACHE_BASE = "/tmp/auth-gate-cache"
 
 
 def _sanitize(val: str) -> str:
@@ -49,15 +63,68 @@ def _timeout(config: dict) -> int:
     return config.get("services", {}).get("git", {}).get("timeout", 120)
 
 
+def _cache_dir_for(repo: str) -> str:
+    """Deterministic bare-cache path for a repo URL."""
+    h = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    return os.path.join(CACHE_BASE, h)
+
+
+def _ensure_cache(repo: str, config: dict) -> str:
+    """Ensure a bare clone exists in the cache, update it, return its path."""
+    cache_dir = _cache_dir_for(repo)
+    env = _ssh_env(config)
+    timeout = _timeout(config)
+
+    if os.path.isdir(cache_dir):
+        # Update existing cache
+        log.info("Updating cache %s …", cache_dir)
+        try:
+            subprocess.run(
+                "git fetch origin",
+                shell=True, cwd=cache_dir, env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            log.warning("Cache fetch timed out — continuing with stale cache")
+        except Exception as e:
+            log.warning("Cache fetch error (continuing): %s", e)
+    else:
+        # Full bare clone
+        os.makedirs(CACHE_BASE, exist_ok=True)
+        log.info("Cloning bare cache %s …", cache_dir)
+        try:
+            subprocess.run(
+                f"git clone --bare {repo} {cache_dir}",
+                shell=True, env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"Initial clone timed out after {timeout}s")
+
+    return cache_dir
+
+
+def _git_in_cache(cache_dir: str, *args: str, env: dict, timeout: int) -> subprocess.CompletedProcess:
+    """Run a git command inside the bare cache directory."""
+    cmd = "git " + " ".join(args)
+    return subprocess.run(
+        cmd, shell=True, cwd=cache_dir, env=env,
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
 @service("git")
 class GitService(BaseService):
 
-    valid_actions = {"push", "clone", "fetch", "pull"}
+    valid_actions = {"fetch-bundle", "push-bundle"}
 
     @classmethod
     def validate(cls, action: str, data: dict) -> None:
         if action not in cls.valid_actions:
-            raise ValueError(f"Unsupported git action: '{action}'. Use: {', '.join(cls.valid_actions)}")
+            raise ValueError(
+                f"Unsupported git action: '{action}'. "
+                f"Use: {', '.join(cls.valid_actions)}"
+            )
 
         repo = _sanitize(data.get("repo", ""))
         if not repo:
@@ -65,78 +132,207 @@ class GitService(BaseService):
         if not repo.startswith("git@") and not repo.startswith("ssh://"):
             raise ValueError("Only SSH git URLs are allowed (git@ or ssh://)")
 
-        if action != "clone":
-            workdir = _sanitize(data.get("workdir", ""))
-            if not workdir:
-                raise ValueError(f"'workdir' is required for '{action}'")
-            if not os.path.isdir(workdir):
-                raise ValueError(f"Workdir does not exist: {workdir}")
+        if action == "fetch-bundle":
+            branch = _sanitize(data.get("branch", ""))
+            if not branch:
+                raise ValueError("'branch' is required for 'fetch-bundle'")
+
+        if action == "push-bundle":
+            if not data.get("bundle_b64", ""):
+                raise ValueError("'bundle_b64' is required for 'push-bundle'")
 
     @classmethod
     def execute(cls, action: str, data: dict, config: dict) -> dict:
-        """Run a git command and return the result."""
         env = _ssh_env(config)
         timeout = _timeout(config)
 
-        repo = _sanitize(data.get("repo", ""))
-        branch = _sanitize(data.get("branch", ""))
-        refspec = _sanitize(data.get("refspec", ""))
-
-        if action == "clone":
-            target_dir = _sanitize(data.get("target_dir", "") or data.get("target-dir", ""))
-            cmd = f"git clone --progress {repo}"
-            if branch:
-                cmd += f" --branch {branch}"
-            if target_dir:
-                cmd += f" {target_dir}"
-            workdir = "."  # git clone creates the target dir itself
+        if action == "fetch-bundle":
+            return cls._fetch_bundle(data, config, env, timeout)
+        elif action == "push-bundle":
+            return cls._push_bundle(data, config, env, timeout)
         else:
-            workdir = _sanitize(data.get("workdir", ""))
-            if action == "push":
-                cmd = "git push origin"
-                if branch:
-                    cmd += f" {branch}"
-                if refspec:
-                    cmd += f" {refspec}"
-            elif action == "fetch":
-                cmd = "git fetch origin"
-                if branch:
-                    cmd += f" {branch}"
-            elif action == "pull":
-                cmd = "git pull origin"
-                if branch:
-                    cmd += f" {branch}"
-            else:
-                raise ValueError(f"Unsupported git action: '{action}'")
+            raise ValueError(f"Unsupported git action: '{action}'")
 
-        log.info("→ git %s  (workdir=%s)", action, workdir)
+    # ── Bundle: clone/fetch via bundle ─────────────────────────────────────
+
+    @classmethod
+    def _fetch_bundle(cls, data: dict, config: dict, env: dict, timeout: int) -> dict:
+        """
+        Create a git bundle that the client can use to clone or fetch.
+
+        Maintains a bare cache of the repo on the gateway. On first call
+        the cache is created via git clone --bare. Subsequent calls do a
+        lightweight git fetch origin.
+
+        The bundle contains only the delta from known_ref (if provided and
+        valid), or a full snapshot if not.
+        """
+        repo = _sanitize(data.get("repo", ""))
+        branch = _sanitize(data.get("branch", "main"))
+        known_ref = _sanitize(data.get("known_ref", ""))
+
+        # 1. Ensure the bare cache exists and is up to date
+        try:
+            cache_dir = _ensure_cache(repo, config)
+        except Exception as e:
+            return {"success": False, "output": f"Failed to prepare cache: {e}", "exit_code": -1}
+
+        # 2. Determine what to put in the bundle
+        ref_spec = f"origin/{branch}"
+        bundle_ref = f"refs/heads/{branch}"
+
+        use_delta = bool(known_ref)
+        if use_delta:
+            # Verify known_ref exists in the cache
+            check = subprocess.run(
+                ["git", "cat-file", "-e", known_ref],
+                cwd=cache_dir, capture_output=True, timeout=10,
+            )
+            if check.returncode != 0:
+                log.warning("known_ref %s not found in cache — falling back to full bundle", known_ref)
+                use_delta = False
+
+        # 3. Create the bundle
+        bundle_id = secrets.token_hex(8)
+        bundle_path = os.path.join(tempfile.gettempdir(), f"gate-bundle-{bundle_id}.bundle")
 
         try:
+            if use_delta:
+                cmd = f"git bundle create {bundle_path} {ref_spec} --not {known_ref}"
+            else:
+                cmd = f"git bundle create {bundle_path} --all"
+
+            log.info("Creating bundle %s (delta=%s)", bundle_id, use_delta)
             result = subprocess.run(
-                cmd,
-                shell=True,
-                cwd=workdir,
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
+                cmd, shell=True, cwd=cache_dir, env=env,
+                capture_output=True, text=True, timeout=timeout,
             )
-            log.info("← exit=%d  stdout=%dB  stderr=%dB",
-                     result.returncode, len(result.stdout or ""), len(result.stderr or ""))
-            return {
-                "success": result.returncode == 0,
-                "output": (result.stdout or "") + "\n" + (result.stderr or ""),
-                "exit_code": result.returncode,
-            }
-        except subprocess.TimeoutExpired:
-            log.warning("Git command timed out after %ds", timeout)
-            return {"success": False, "output": f"TIMEOUT after {timeout}s", "exit_code": -1}
+            if result.returncode != 0:
+                err = (result.stderr or "") + (result.stdout or "")
+                return {"success": False, "output": f"Bundle creation failed: {err}", "exit_code": result.returncode}
+
+            size = os.path.getsize(bundle_path)
+            log.info("Bundle %s created: %d bytes", bundle_id, size)
         except Exception as e:
-            log.error("Git execution error: %s", e)
+            return {"success": False, "output": f"Bundle creation error: {e}", "exit_code": -1}
+
+        return {
+            "success": True,
+            "output": f"Bundle created: {size} bytes",
+            "exit_code": 0,
+            "_binary_file": bundle_path,
+        }
+
+    # ── Bundle: push via bundle ────────────────────────────────────────────
+
+    @classmethod
+    def _push_bundle(cls, data: dict, config: dict, env: dict, timeout: int) -> dict:
+        """
+        Accept a base64-encoded git bundle from the client, apply it to
+        the bare cache, and push to origin.
+
+        The client creates the bundle locally with:
+            git bundle create changes.bundle HEAD --not refs/remotes/origin/<branch>
+        """
+        repo = _sanitize(data.get("repo", ""))
+        branch = _sanitize(data.get("branch", "main"))
+        b64 = data.get("bundle_b64", "")
+
+        # 1. Decode bundle
+        try:
+            bundle_bytes = base64.b64decode(b64)
+        except Exception as e:
+            return {"success": False, "output": f"Failed to decode bundle: {e}", "exit_code": -1}
+
+        bundle_path = os.path.join(
+            tempfile.gettempdir(),
+            f"gate-push-{secrets.token_hex(8)}.bundle",
+        )
+        try:
+            with open(bundle_path, "wb") as f:
+                f.write(bundle_bytes)
+        except Exception as e:
+            return {"success": False, "output": f"Failed to write bundle: {e}", "exit_code": -1}
+
+        try:
+            # 2. Ensure cache exists and is up to date
+            cache_dir = _ensure_cache(repo, config)
+
+            # 3. Fetch the bundle contents into the cache
+            #    The bundle contains refs/heads/<branch> with the client's commits
+            log.info("Applying push bundle for %s/%s", repo, branch)
+            fetch_result = subprocess.run(
+                f"git fetch {bundle_path} refs/heads/{branch}:refs/heads/{branch}",
+                shell=True, cwd=cache_dir, env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            if fetch_result.returncode != 0:
+                err = (fetch_result.stderr or "") + (fetch_result.stdout or "")
+                return {
+                    "success": False,
+                    "output": f"Failed to apply bundle to cache: {err}",
+                    "exit_code": fetch_result.returncode,
+                }
+
+            # 4. Push to origin
+            log.info("Pushing %s/%s to origin", repo, branch)
+            push_result = subprocess.run(
+                f"git push origin {branch}:{branch}",
+                shell=True, cwd=cache_dir, env=env,
+                capture_output=True, text=True, timeout=timeout,
+            )
+            output = (push_result.stdout or "") + (push_result.stderr or "")
+            log.info("Push result: exit=%d", push_result.returncode)
+
+            return {
+                "success": push_result.returncode == 0,
+                "output": output,
+                "exit_code": push_result.returncode,
+            }
+        except Exception as e:
             return {"success": False, "output": str(e), "exit_code": -1}
+        finally:
+            # Clean up the received bundle
+            try:
+                os.unlink(bundle_path)
+            except OSError:
+                pass
+
+    # ── Approval text ──────────────────────────────────────────────────────
 
     @classmethod
     def approval_text(cls, action: str, data: dict, request_id: str) -> str:
+        if action == "fetch-bundle":
+            lines = [
+                "🔐 *Auth Proxy — Git Fetch Bundle*",
+                f"`{request_id[:16]}…`",
+                "",
+                f"📋 *Action:* `{action}`",
+                f"📦 *Repo:* `{data.get('repo')}`",
+            ]
+            if data.get("branch"):
+                lines.append(f"🌿 *Branch:* `{data['branch']}`")
+            if data.get("known_ref"):
+                lines.append(f"🔖 *Known ref:* `{data['known_ref'][:12]}…`")
+            if data.get("details"):
+                lines.append(f"\n📝 *Details:*\n{data['details']}")
+            return "\n".join(lines)
+
+        elif action == "push-bundle":
+            lines = [
+                "🔐 *Auth Proxy — Git Push Bundle*",
+                f"`{request_id[:16]}…`",
+                "",
+                f"📋 *Action:* `push changes`",
+                f"📦 *Repo:* `{data.get('repo')}`",
+            ]
+            if data.get("branch"):
+                lines.append(f"🌿 *Branch:* `{data['branch']}`")
+            if data.get("details"):
+                lines.append(f"\n📝 *Details:*\n{data['details']}")
+            return "\n".join(lines)
+
+        # Fallback for legacy actions
         lines = [
             "🔐 *Auth Proxy — Git Operation*",
             f"`{request_id[:16]}…`",
@@ -154,43 +350,4 @@ class GitService(BaseService):
             lines.append(f"📁 *Workdir:* `{data['workdir']}`")
         if data.get("details"):
             lines.append(f"\n📝 *Details:*\n{data['details']}")
-
-        ctx = cls.context(action, data)
-        if ctx:
-            lines.append(f"\n📊 *Context:*\n```\n{ctx}\n```")
-
         return "\n".join(lines)
-
-    @classmethod
-    def context(cls, action: str, data: dict) -> str:
-        """Gather local git context for richer approval messages."""
-        workdir = data.get("workdir", "")
-        if not workdir or not os.path.isdir(workdir):
-            return ""
-
-        def _sh(cmd: str) -> str:
-            try:
-                r = subprocess.run(cmd, shell=True, cwd=workdir,
-                                   capture_output=True, text=True, timeout=5)
-                return r.stdout.strip() if r.returncode == 0 else ""
-            except Exception:
-                return ""
-
-        parts = []
-        branch = _sh("git rev-parse --abbrev-ref HEAD 2>/dev/null")
-        if branch:
-            parts.append(f"Branch: {branch}")
-        url = _sh("git remote get-url origin 2>/dev/null")
-        if url:
-            parts.append(f"Remote: {url}")
-        logs = _sh("git log --oneline -5 2>/dev/null")
-        if logs:
-            parts.append(f"Recent:\n{logs}")
-        ahead = _sh("git log --oneline @{u}..HEAD 2>/dev/null")
-        if ahead:
-            parts.append(f"Ahead of remote:\n{ahead}")
-        stats = _sh("git diff --stat 2>/dev/null | tail -1")
-        if stats:
-            parts.append(f"Uncommitted: {stats}")
-
-        return "\n".join(parts)

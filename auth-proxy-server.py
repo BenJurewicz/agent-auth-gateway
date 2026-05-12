@@ -6,6 +6,11 @@ Sits in a Proxmox LXC container, holds all service credentials (SSH keys,
 API tokens, etc.), and requires explicit Telegram approval before executing
 any privileged operation.
 
+Endpoints:
+  POST /gate/{service}/{action}      — JSON response (for text-based operations)
+  POST /gate/pull/{service}/{action} — Binary stream response (for bundle downloads)
+  GET  /health                       — Health check
+
 Extensible via service plugins in services/*.py.
 
 Usage:
@@ -17,6 +22,7 @@ Env overrides:
 """
 
 import asyncio
+import json
 import logging
 import os
 import secrets
@@ -28,7 +34,7 @@ from pathlib import Path
 from typing import Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Response
 from pydantic import BaseModel
 import uvicorn
 
@@ -336,7 +342,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Auth Proxy",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
     docs_url="/docs" if os.environ.get("AUTH_PROXY_DEBUG") else None,
     redoc_url=None,
@@ -373,41 +379,39 @@ async def _check_auth(authorization: str | None = Header(None)) -> bool:
     return authorization == expected
 
 
-# ── Endpoints ────────────────────────────────────────────────────────────────
+# ── Shared Gate Logic ────────────────────────────────────────────────────────
 
-@app.post("/gate/{service}/{action}")
-async def handle_gate(
+async def _run_gate_flow(
     service: str,
     action: str,
     body: GateRequest,
-    authorization: str | None = Header(None),
-) -> GateResponse:
-    """Submit a service operation for approval and execution.
-
-    The request goes through:
-      1. Validation
-      2. Telegram approval (the user taps ✅ or ❌)
-      3. Execution on the proxy
-
-    Returns the execution result.
+    authorization: str | None,
+) -> tuple:
     """
-    if not await _check_auth(authorization):
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    Validate auth, service, params, run approval, and execute.
 
+    Returns (svc_class, pending_req, exec_result, None) on success, or
+    (None, None, None, error_response) on failure (error_response is
+    either an HTTPException or a dict for JSON/binary endpoints).
+    """
+    # Auth
+    if not await _check_auth(authorization):
+        return (None, None, None, HTTPException(status_code=401, detail="Unauthorized"))
+
+    # Service lookup
     svc = get_service(service)
     if not svc:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown service: '{service}'. Available: {', '.join(list_services())}",
-        )
+        return (None, None, None, HTTPException(
+            status_code=404, detail=f"Unknown service: '{service}'. Available: {', '.join(list_services())}"
+        ))
 
-    # Validate
+    # Validation
     try:
         svc.validate(action, body.params)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return (None, None, None, HTTPException(status_code=400, detail=str(e)))
 
-    # Determine approval mode
+    # Approval mode
     approval_mode = config.get("approval", {}).get("mode", "telegram")
     tg_configured = bool(
         config.get("telegram", {}).get("bot_token", "")
@@ -426,7 +430,8 @@ async def handle_gate(
             await send_approval(req)
         except Exception as e:
             await request_store.remove(req.id)
-            raise HTTPException(status_code=502, detail=f"Failed to send Telegram approval: {e}")
+            err = HTTPException(status_code=502, detail=f"Failed to send Telegram approval: {e}")
+            return (None, None, None, err)
     elif approval_mode == "auto":
         log.info("Auto-approval — approving without user interaction")
         req.approve()
@@ -438,7 +443,8 @@ async def handle_gate(
             req.deny()
     else:
         await request_store.remove(req.id)
-        raise HTTPException(status_code=500, detail=f"Unknown approval mode: {approval_mode}")
+        err = HTTPException(status_code=500, detail=f"Unknown approval mode: {approval_mode}")
+        return (None, None, None, err)
 
     # ── Wait for result ─────────────────────────────────────────────────
     ttl = req.ttl
@@ -447,19 +453,25 @@ async def handle_gate(
     except asyncio.TimeoutError:
         req.fail_timeout()
         await request_store.remove(req.id)
-        return GateResponse(
-            success=False, output="Approval timed out", exit_code=-1,
-            approved=False, request_id=req.id, service=service, action=action,
-        )
+        timeout_result = {
+            "success": False, "output": "Approval timed out", "exit_code": -1,
+            "approved": False, "request_id": req.id, "service": service, "action": action,
+        }
+        return (None, None, None, timeout_result)
 
     if not req.approved:
         result = req.result or {"success": False, "output": "Denied", "exit_code": -1}
         await request_store.remove(req.id)
-        return GateResponse(
-            success=result["success"], output=result.get("output", ""),
-            exit_code=result.get("exit_code", -1), approved=False,
-            request_id=req.id, service=service, action=action,
-        )
+        denied_result = {
+            "success": result["success"],
+            "output": result.get("output", ""),
+            "exit_code": result.get("exit_code", -1),
+            "approved": False,
+            "request_id": req.id,
+            "service": service,
+            "action": action,
+        }
+        return (None, None, None, denied_result)
 
     # ── Execute ─────────────────────────────────────────────────────────
     try:
@@ -468,11 +480,47 @@ async def handle_gate(
         log.error("Service execution error: %s", e)
         exec_result = {"success": False, "output": f"Execution error: {e}", "exit_code": -1}
 
-    output = exec_result.get("output", "").strip()
     await request_store.remove(req.id)
+    return (svc, req, exec_result, None)
+
+
+# ── Endpoints ────────────────────────────────────────────────────────────────
+
+@app.post("/gate/{service}/{action}")
+async def handle_gate(
+    service: str,
+    action: str,
+    body: GateRequest,
+    authorization: str | None = Header(None),
+) -> GateResponse:
+    """Submit a service operation for approval and execution.
+
+    The request goes through:
+      1. Validation
+      2. Telegram approval (the user taps ✅ or ❌)
+      3. Execution on the proxy
+
+    Returns the execution result as JSON.
+    """
+    svc, req, exec_result, err = await _run_gate_flow(service, action, body, authorization)
+
+    if err is not None:
+        if isinstance(err, HTTPException):
+            raise err
+        # err is a dict (timeout or denied result)
+        return GateResponse(
+            success=err.get("success", False),
+            output=err.get("output", ""),
+            exit_code=err.get("exit_code", -1),
+            approved=err.get("approved", False),
+            request_id=err.get("request_id", ""),
+            service=service,
+            action=action,
+        )
+
     return GateResponse(
         success=exec_result.get("success", False),
-        output=output,
+        output=exec_result.get("output", "").strip(),
         exit_code=exec_result.get("exit_code", -1),
         approved=True,
         request_id=req.id,
@@ -481,12 +529,81 @@ async def handle_gate(
     )
 
 
+@app.post("/gate/pull/{service}/{action}")
+async def handle_gate_pull(
+    service: str,
+    action: str,
+    body: GateRequest,
+    authorization: str | None = Header(None),
+) -> Response:
+    """Binary-download variant of /gate/{service}/{action}.
+
+    Same auth, validation, and Telegram approval flow. After execution,
+    if the service returns a file path via ``_binary_file``, the file is
+    streamed as application/octet-stream. Otherwise a JSON GateResponse
+    is returned.
+    """
+    svc, req, exec_result, err = await _run_gate_flow(service, action, body, authorization)
+
+    # Handle errors
+    if err is not None:
+        if isinstance(err, HTTPException):
+            raise err
+        # err is a dict (timeout or denied result)
+        return Response(
+            content=json.dumps(err),
+            media_type="application/json",
+            status_code=403 if err.get("approved") is False else 408,
+        )
+
+    # Check for binary file in the result
+    binary_file = exec_result.pop("_binary_file", None)
+    if binary_file and exec_result.get("success"):
+        try:
+            with open(binary_file, "rb") as f:
+                content = f.read()
+            os.unlink(binary_file)
+            log.info("Streamed bundle %s (%d bytes) in /gate/pull response", binary_file, len(content))
+            return Response(
+                content=content,
+                media_type="application/octet-stream",
+                headers={
+                    "Content-Disposition": "attachment; filename=repo.bundle",
+                    "Content-Length": str(len(content)),
+                    "X-Repo-Url": body.params.get("repo", ""),
+                },
+            )
+        except Exception as e:
+            log.error("Failed to read/stream bundle: %s", e)
+            return Response(
+                content=json.dumps({
+                    "success": False, "output": f"Failed to read bundle: {e}", "exit_code": -1,
+                }),
+                media_type="application/json",
+                status_code=500,
+            )
+
+    # Normal JSON response (no binary file)
+    return Response(
+        content=json.dumps({
+            "success": exec_result.get("success", False),
+            "output": exec_result.get("output", "").strip(),
+            "exit_code": exec_result.get("exit_code", -1),
+            "approved": True,
+            "request_id": req.id,
+            "service": service,
+            "action": action,
+        }),
+        media_type="application/json",
+    )
+
+
 @app.get("/health")
 async def health() -> dict:
     cnt = await request_store.count
     return {
         "status": "ok",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "pending_requests": cnt,
         "services": list_services(),
     }
