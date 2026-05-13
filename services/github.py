@@ -39,6 +39,14 @@ def _api_headers(config: dict) -> dict:
     }
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y")
+    return default
+
+
 def _gh_api(method: str, path: str, headers: dict, body: dict | None = None, timeout: int = 30) -> dict:
     """Make a GitHub API request and return parsed JSON."""
     url = f"{API_BASE}{path}"
@@ -155,7 +163,6 @@ class GitHubService(BaseService):
             private = "🔒" if r.get("private") else "🌐"
             fork = " 🍴" if r.get("fork") else ""
             archived = " 🗄" if r.get("archived") else ""
-            url = r.get("html_name", r.get("clone_url", ""))
 
             if filter_name and filter_name not in rname.lower():
                 continue
@@ -203,9 +210,9 @@ class GitHubService(BaseService):
     @classmethod
     def _create_repo(cls, data: dict, headers: dict, timeout: int) -> dict:
         name = data.get("name", "").strip()
-        private = data.get("private", "true").lower() in ("true", "yes", "1")
+        private = _as_bool(data.get("private"), default=True)
         description = data.get("description", "").strip()
-        auto_init = data.get("auto_init", "false").lower() in ("true", "yes", "1")
+        auto_init = _as_bool(data.get("auto_init"), default=False)
 
         body = {
             "name": name,
@@ -287,7 +294,7 @@ class GitHubService(BaseService):
                 "",
                 f"📋 *Action:* `create-repo`",
                 f"📦 *Name:* `{data.get('name', '?')}`",
-                f"🔒 *Visibility:* {'Private' if data.get('private', 'true').lower() in ('true', 'yes', '1') else 'Public'}",
+                f"🔒 *Visibility:* {'Private' if _as_bool(data.get('private'), default=True) else 'Public'}",
             ]
             if data.get("description"):
                 lines.append(f"📝 *Description:* {data['description']}")
