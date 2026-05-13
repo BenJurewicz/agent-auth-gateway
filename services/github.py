@@ -47,6 +47,19 @@ def _as_bool(value, default: bool = False) -> bool:
     return default
 
 
+def _md_escape(value) -> str:
+    text = str(value)
+    for char in ("\\", "_", "*", "`", "[", "]"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def _md_code(value, default: str = "?") -> str:
+    if value is None:
+        value = default
+    return f"`{_md_escape(value)}`"
+
+
 def _gh_api(method: str, path: str, headers: dict, body: dict | None = None, timeout: int = 30) -> dict:
     """Make a GitHub API request and return parsed JSON."""
     url = f"{API_BASE}{path}"
@@ -293,13 +306,13 @@ class GitHubService(BaseService):
                 f"`{request_id[:16]}…`",
                 "",
                 f"📋 *Action:* `create-repo`",
-                f"📦 *Name:* `{data.get('name', '?')}`",
+                f"📦 *Name:* {_md_code(data.get('name'))}",
                 f"🔒 *Visibility:* {'Private' if _as_bool(data.get('private'), default=True) else 'Public'}",
             ]
             if data.get("description"):
-                lines.append(f"📝 *Description:* {data['description']}")
+                lines.append(f"📝 *Description:* {_md_escape(data['description'])}")
             if data.get("details"):
-                lines.append(f"\n📎 *Details:*\n{data['details']}")
+                lines.append(f"\n📎 *Details:*\n{_md_escape(data['details'])}")
             return "\n".join(lines)
 
         elif action == "create-pr":
@@ -308,17 +321,18 @@ class GitHubService(BaseService):
                 f"`{request_id[:16]}…`",
                 "",
                 f"📋 *Action:* `create-pr`",
-                f"📦 *Repo:* `{data.get('owner', '?')}/{data.get('repo', '?')}`",
-                f"🌿 *Head:* `{data.get('head', '?')}` → `{data.get('base', '?')}`",
-                f"📰 *Title:* {data.get('title', '?')}",
+                f"📦 *Repo:* {_md_code(data.get('owner'))}/{_md_code(data.get('repo'))}",
+                f"🌿 *Head:* {_md_code(data.get('head'))} → {_md_code(data.get('base'))}",
+                f"📰 *Title:* {_md_escape(data.get('title', '?'))}",
             ]
             if data.get("body"):
-                body_preview = data["body"][:200]
-                if len(data["body"]) > 200:
+                body = str(data["body"])
+                body_preview = body[:200]
+                if len(body) > 200:
                     body_preview += "…"
-                lines.append(f"📄 *Body:*\n{body_preview}")
+                lines.append(f"📄 *Body:*\n{_md_escape(body_preview)}")
             if data.get("details"):
-                lines.append(f"\n📎 *Details:*\n{data['details']}")
+                lines.append(f"\n📎 *Details:*\n{_md_escape(data['details'])}")
             return "\n".join(lines)
 
         return "\n".join([
