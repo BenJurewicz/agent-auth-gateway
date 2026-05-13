@@ -64,6 +64,8 @@ logging.basicConfig(
 )
 log = logging.getLogger("auth-proxy")
 
+APP_VERSION = "1.2.0"
+
 # ── Config Loading ───────────────────────────────────────────────────────────
 CONFIG_PATH = Path(__file__).parent.resolve() / "config.yaml"
 
@@ -345,7 +347,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Auth Proxy",
-    version="1.2.0",
+    version=APP_VERSION,
     lifespan=lifespan,
     docs_url="/docs" if os.environ.get("AUTH_PROXY_DEBUG") else None,
     redoc_url=None,
@@ -367,6 +369,31 @@ class GateResponse(BaseModel):
     request_id: str = ""
     service: str = ""
     action: str = ""
+
+
+def _gate_response_payload(
+    result: dict,
+    *,
+    approved: bool,
+    request_id: str,
+    service: str,
+    action: str,
+) -> dict:
+    payload = dict(result)
+    output = payload.get("output", "")
+    if isinstance(output, str):
+        output = output.strip()
+
+    payload.update({
+        "success": payload.get("success", False),
+        "output": output,
+        "exit_code": payload.get("exit_code", -1),
+        "approved": approved,
+        "request_id": request_id,
+        "service": service,
+        "action": action,
+    })
+    return payload
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -501,7 +528,7 @@ async def handle_gate(
     action: str,
     body: GateRequest,
     authorization: str | None = Header(None),
-) -> GateResponse:
+) -> dict:
     """Submit a service operation for approval and execution.
 
     The request goes through:
@@ -517,20 +544,16 @@ async def handle_gate(
         if isinstance(err, HTTPException):
             raise err
         # err is a dict (timeout or denied result)
-        return GateResponse(
-            success=err.get("success", False),
-            output=err.get("output", ""),
-            exit_code=err.get("exit_code", -1),
+        return _gate_response_payload(
+            err,
             approved=err.get("approved", False),
             request_id=err.get("request_id", ""),
             service=service,
             action=action,
         )
 
-    return GateResponse(
-        success=exec_result.get("success", False),
-        output=exec_result.get("output", "").strip(),
-        exit_code=exec_result.get("exit_code", -1),
+    return _gate_response_payload(
+        exec_result,
         approved=True,
         request_id=req.id,
         service=service,
@@ -566,7 +589,8 @@ async def handle_gate_pull(
         )
 
     # Check for binary file in the result
-    binary_file = exec_result.pop("_binary_file", None)
+    response_result = dict(exec_result)
+    binary_file = response_result.pop("_binary_file", None)
     if binary_file and exec_result.get("success"):
         try:
             with open(binary_file, "rb") as f:
@@ -594,15 +618,13 @@ async def handle_gate_pull(
 
     # Normal JSON response (no binary file)
     return Response(
-        content=json.dumps({
-            "success": exec_result.get("success", False),
-            "output": exec_result.get("output", "").strip(),
-            "exit_code": exec_result.get("exit_code", -1),
-            "approved": True,
-            "request_id": req.id,
-            "service": service,
-            "action": action,
-        }),
+        content=json.dumps(_gate_response_payload(
+            response_result,
+            approved=True,
+            request_id=req.id,
+            service=service,
+            action=action,
+        )),
         media_type="application/json",
     )
 
@@ -612,7 +634,7 @@ async def health() -> dict:
     cnt = await request_store.count
     return {
         "status": "ok",
-        "version": "1.1.0",
+        "version": APP_VERSION,
         "pending_requests": cnt,
         "services": list_services(),
     }
