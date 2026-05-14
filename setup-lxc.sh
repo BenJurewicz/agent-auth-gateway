@@ -11,15 +11,15 @@
 # This script will:
 #   1. Install system dependencies (python3, pip, git, ssh)
 #   2. Install Python packages (fastapi, uvicorn, pyyaml, python-telegram-bot)
-#   3. Copy the auth-proxy files to /opt/auth-proxy/
+#   3. Copy the auth-proxy files to /opt/agent-auth-gateway/
 #   4. Create a systemd service for auto-start
 #   5. (Optionally) prompt you to configure config.yaml
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="/opt/auth-proxy"
-SERVICE_NAME="auth-proxy"
+INSTALL_DIR="/opt/agent-auth-gateway"
+SERVICE_NAME="agent-auth-gateway"
 
 echo "=== Auth Proxy LXC Setup ==="
 echo ""
@@ -65,8 +65,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/opt/auth-proxy/venv/bin/python /opt/auth-proxy/auth-proxy-server.py
-WorkingDirectory=/opt/auth-proxy
+ExecStart=/opt/agent-auth-gateway/venv/bin/python /opt/agent-auth-gateway/auth-proxy-server.py
+WorkingDirectory=/opt/agent-auth-gateway
 Restart=on-failure
 RestartSec=5
 User=root
@@ -104,9 +104,9 @@ echo "     Copy your GitHub SSH key to:"
 echo "       /root/.ssh/id_ed25519"
 echo "     (or the path specified in config.yaml)"
 echo ""
-echo "  3. START:  systemctl start auth-proxy"
-echo "     STATUS: systemctl status auth-proxy"
-echo "     LOGS:   journalctl -u auth-proxy -f"
+echo "  3. START:  systemctl start ${SERVICE_NAME}"
+echo "     STATUS: systemctl status ${SERVICE_NAME}"
+echo "     LOGS:   journalctl -u ${SERVICE_NAME} -f"
 echo ""
 echo "  4. ADD A NEW SERVICE:"
 echo "     Create a new file in ${INSTALL_DIR}/services/"

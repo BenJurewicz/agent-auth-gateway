@@ -37,11 +37,11 @@ privileged operation.
 
 | Service | Action   | Description                                      |
 |---------|----------|--------------------------------------------------|
-| `git`   | `push`   | Push commits to a remote repository              |
-| `git`   | `clone`  | Clone a repository (including private repos)     |
-| `git`   | `fetch`  | Fetch updates from a remote                      |
-| `git`   | `pull`   | Pull updates from a remote                       |
-| —       | —        | _(More services added as needed)_                |
+| `git`   | `fetch-bundle` | Download a git bundle for local clone/fetch |
+| `git`   | `push-bundle`  | Upload a local git bundle and push it       |
+| `github` | `list-repos` | List repositories visible to the GitHub token |
+| `github` | `create-repo` | Create a GitHub repository                  |
+| `github` | `create-pr`   | Create a GitHub pull request                |
 
 Only SSH git URLs are allowed (`git@github.com:user/repo.git` or `ssh://`).
 
@@ -147,12 +147,13 @@ nano config.yaml  # set approval.mode: console
 python auth-proxy-client.py --proxy-url http://localhost:8443 \
   --auth-token "your-secret" health
 
-# Test a git clone via proxy
+# Test a git clone via bundle transport
 mkdir -p /tmp/test-proxy
 python auth-proxy-client.py --proxy-url http://localhost:8443 \
-  --auth-token "your-secret" gate git clone \
-  --param repo=git@github.com:github/gitignore.git \
-  --param target-dir=/tmp/test-proxy/gitignore \
+  --auth-token "your-secret" fetch-bundle \
+  --repo git@github.com:github/gitignore.git \
+  --target-dir /tmp/test-proxy/gitignore \
+  --branch main \
   --details "Testing the proxy"
 ```
 
@@ -265,29 +266,38 @@ proxy = AuthProxyClient(
     auth_token="your-secret-token",
 )
 
-# ── Git ──
-result = proxy.git_push(
+# ── Git bundle transport ──
+result = proxy.git_fetch_bundle(
+    repo="git@github.com:user/private-repo.git",
+    target_dir="/home/agent/projects/private-repo",
+    branch="main",
+    details="Clone private repo locally",
+)
+print(result["output"])
+
+result = proxy.git_push_bundle(
     repo="git@github.com:user/my-project.git",
     workdir="/home/agent/projects/my-project",
     branch="main",
     details="Auto-generated feature X",
 )
-print(result["output"])
-
-result = proxy.git_clone(
-    repo="git@github.com:user/private-repo.git",
-    target_dir="/home/agent/projects/private-repo",
-)
-
-proxy.git_fetch(repo="git@github.com:user/my-project.git", workdir="/path")
-proxy.git_pull(repo="git@github.com:user/my-project.git", workdir="/path")
 
 # ── Any service (generic) ──
-result = proxy.gate("git", "push", {
+result = proxy.gate("git", "push-bundle", {
     "repo": "git@github.com:user/my-project.git",
-    "workdir": "/path",
     "branch": "main",
+    "bundle_b64": "...",
 }, details="Description")
+
+# ── GitHub API ──
+repos = proxy.github_list_repos(filter="my-project")
+pr = proxy.github_create_pr(
+    owner="user",
+    repo="my-project",
+    title="Add feature",
+    head="feature-branch",
+    base="main",
+)
 
 # ── Health ──
 print(proxy.health())
@@ -300,24 +310,24 @@ print(proxy.health())
 export AUTH_PROXY_URL="http://auth-proxy.lxc:8443"
 export AUTH_PROXY_TOKEN="your-secret-token"
 
-# Git operations
-python auth-proxy-client.py gate git push \
-    --param repo=git@github.com:user/my-project.git \
-    --param workdir=/home/agent/projects/my-project \
-    --param branch=main \
+# Git bundle transport
+python auth-proxy-client.py fetch-bundle \
+    --repo git@github.com:user/private-repo.git \
+    --target-dir /home/agent/projects/private-repo \
+    --branch main \
+    --details "Clone private repo locally"
+
+python auth-proxy-client.py push-bundle \
+    --repo git@github.com:user/my-project.git \
+    --workdir /home/agent/projects/my-project \
+    --branch main \
     --details "Auto-generated feature X"
 
-python auth-proxy-client.py gate git clone \
-    --param repo=git@github.com:user/private-repo.git \
-    --param target-dir=/home/agent/output
-
-python auth-proxy-client.py gate git fetch \
-    --param repo=git@github.com:user/my-project.git \
-    --param workdir=/path
-
-python auth-proxy-client.py gate git pull \
-    --param repo=git@github.com:user/my-project.git \
-    --param workdir=/path
+# GitHub API
+python auth-proxy-client.py github-list-repos --filter my-project
+python auth-proxy-client.py github-create-pr \
+    --owner user --repo my-project \
+    --title "Add feature" --head feature-branch --base main
 
 # Health check
 python auth-proxy-client.py health
@@ -418,9 +428,9 @@ Content-Type: application/json
 ```json
 {
   "status": "ok",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "pending_requests": 0,
-  "services": ["git"]
+  "services": ["git", "github"]
 }
 ```
 
@@ -436,7 +446,8 @@ auth-proxy/
 ├── auth-proxy-client.py           # Client library and CLI
 └── services/
     ├── __init__.py                # Service registry + BaseService
-    ├── git.py                     # Git/GitHub service
+    ├── git.py                     # Git bundle transport service
+    ├── github.py                  # GitHub REST API service
     └── calendar.py                # (future) Google Calendar service
 ```
 
@@ -489,10 +500,10 @@ AUTH_PROXY_TOKEN=test-token python auth-proxy-server.py
 
 # Test with client
 python auth-proxy-client.py health
-python auth-proxy-client.py gate git push \
-    --param repo=git@github.com:test/repo.git \
-    --param workdir=/tmp/test-repo \
-    --param branch=main
+python auth-proxy-client.py fetch-bundle \
+    --repo git@github.com:test/repo.git \
+    --target-dir /tmp/test-repo \
+    --branch main
 
 # Run with console approval mode
 AUTH_PROXY_TOKEN=test-token python auth-proxy-server.py

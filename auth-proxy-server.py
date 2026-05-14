@@ -405,8 +405,8 @@ async def _check_auth(authorization: str | None = Header(None)) -> bool:
     if not expected:
         return False
     if authorization.startswith("Bearer "):
-        return authorization[7:] == expected
-    return authorization == expected
+        return secrets.compare_digest(authorization[7:], expected)
+    return secrets.compare_digest(authorization, expected)
 
 
 # ── Shared Gate Logic ────────────────────────────────────────────────────────

@@ -15,7 +15,10 @@ import base64
 import hashlib
 import logging
 import os
+import re
 import secrets
+import shlex
+import shutil
 import subprocess
 import tempfile
 import time
@@ -40,6 +43,44 @@ def _sanitize(val: str) -> str:
     return val.strip()
 
 
+def _sanitize_branch(val: str) -> str:
+    """Validate and return a git branch name."""
+    branch = _sanitize(val)
+    if not branch:
+        raise ValueError("'branch' is required")
+
+    result = subprocess.run(
+        ["git", "check-ref-format", "--branch", branch],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0 or result.stdout.strip() != branch:
+        raise ValueError(f"Invalid branch name: {branch!r}")
+    return branch
+
+
+def _sanitize_known_ref(val: str) -> str:
+    """Validate an optional known commit hash from the client."""
+    known_ref = _sanitize(val)
+    if not known_ref:
+        return ""
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", known_ref):
+        raise ValueError("'known_ref' must be a commit hash")
+    return known_ref
+
+
+def _md_escape(value) -> str:
+    text = str(value)
+    for char in ("\\", "_", "*", "`", "[", "]"):
+        text = text.replace(char, f"\\{char}")
+    return text
+
+
+def _md_code(value, default: str = "?") -> str:
+    if value is None:
+        value = default
+    return f"`{_md_escape(value)}`"
+
+
 def _ssh_env(config: dict) -> dict:
     """Build environment dict with GIT_SSH_COMMAND set."""
     key_path = os.path.expanduser(
@@ -48,7 +89,7 @@ def _ssh_env(config: dict) -> dict:
         .get("ssh_key_path", "~/.ssh/id_ed25519")
     )
     ssh_cmd = (
-        f"ssh -i {key_path} "
+        f"ssh -i {shlex.quote(key_path)} "
         f"-o StrictHostKeyChecking=accept-new "
         f"-o PasswordAuthentication=no "
         f"-o IdentitiesOnly=yes"
@@ -74,16 +115,31 @@ def _ensure_cache(repo: str, config: dict) -> str:
     cache_dir = _cache_dir_for(repo)
     env = _ssh_env(config)
     timeout = _timeout(config)
+    cache_exists = os.path.isdir(cache_dir)
 
-    if os.path.isdir(cache_dir):
+    if cache_exists:
+        check = subprocess.run(
+            ["git", "rev-parse", "--is-bare-repository"],
+            cwd=cache_dir, env=env,
+            capture_output=True, text=True, timeout=10,
+        )
+        if check.returncode != 0 or check.stdout.strip() != "true":
+            log.warning("Removing invalid bare cache at %s", cache_dir)
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            cache_exists = False
+
+    if cache_exists:
         # Update existing cache
         log.info("Updating cache %s …", cache_dir)
         try:
-            subprocess.run(
-                "git fetch origin",
-                shell=True, cwd=cache_dir, env=env,
+            result = subprocess.run(
+                ["git", "fetch", "origin"],
+                cwd=cache_dir, env=env,
                 capture_output=True, text=True, timeout=timeout,
             )
+            if result.returncode != 0:
+                err = (result.stderr or "") + (result.stdout or "")
+                log.warning("Cache fetch failed (continuing with stale cache): %s", err.strip())
         except subprocess.TimeoutExpired:
             log.warning("Cache fetch timed out — continuing with stale cache")
         except Exception as e:
@@ -93,11 +149,15 @@ def _ensure_cache(repo: str, config: dict) -> str:
         os.makedirs(CACHE_BASE, exist_ok=True)
         log.info("Cloning bare cache %s …", cache_dir)
         try:
-            subprocess.run(
-                f"git clone --bare {repo} {cache_dir}",
-                shell=True, env=env,
+            result = subprocess.run(
+                ["git", "clone", "--bare", repo, cache_dir],
+                env=env,
                 capture_output=True, text=True, timeout=timeout,
             )
+            if result.returncode != 0:
+                err = (result.stderr or "") + (result.stdout or "")
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                raise RuntimeError(f"Initial clone failed: {err.strip()}")
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"Initial clone timed out after {timeout}s")
 
@@ -106,9 +166,9 @@ def _ensure_cache(repo: str, config: dict) -> str:
 
 def _git_in_cache(cache_dir: str, *args: str, env: dict, timeout: int) -> subprocess.CompletedProcess:
     """Run a git command inside the bare cache directory."""
-    cmd = "git " + " ".join(args)
     return subprocess.run(
-        cmd, shell=True, cwd=cache_dir, env=env,
+        ["git", *args],
+        cwd=cache_dir, env=env,
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -133,11 +193,11 @@ class GitService(BaseService):
             raise ValueError("Only SSH git URLs are allowed (git@ or ssh://)")
 
         if action == "fetch-bundle":
-            branch = _sanitize(data.get("branch", ""))
-            if not branch:
-                raise ValueError("'branch' is required for 'fetch-bundle'")
+            _sanitize_branch(data.get("branch", ""))
+            _sanitize_known_ref(data.get("known_ref", ""))
 
         if action == "push-bundle":
+            _sanitize_branch(data.get("branch", "main"))
             if not data.get("bundle_b64", ""):
                 raise ValueError("'bundle_b64' is required for 'push-bundle'")
 
@@ -168,8 +228,8 @@ class GitService(BaseService):
         valid), or a full snapshot if not.
         """
         repo = _sanitize(data.get("repo", ""))
-        branch = _sanitize(data.get("branch", "main"))
-        known_ref = _sanitize(data.get("known_ref", ""))
+        branch = _sanitize_branch(data.get("branch", "main"))
+        known_ref = _sanitize_known_ref(data.get("known_ref", ""))
 
         # 1. Ensure the bare cache exists and is up to date
         try:
@@ -199,13 +259,13 @@ class GitService(BaseService):
 
         try:
             if use_delta:
-                cmd = f"git bundle create {bundle_path} {ref_spec} --not {known_ref}"
+                cmd = ["git", "bundle", "create", bundle_path, ref_spec, "--not", known_ref]
             else:
-                cmd = f"git bundle create {bundle_path} --all"
+                cmd = ["git", "bundle", "create", bundle_path, "--all"]
 
             log.info("Creating bundle %s (delta=%s)", bundle_id, use_delta)
             result = subprocess.run(
-                cmd, shell=True, cwd=cache_dir, env=env,
+                cmd, cwd=cache_dir, env=env,
                 capture_output=True, text=True, timeout=timeout,
             )
             if result.returncode != 0:
@@ -236,12 +296,12 @@ class GitService(BaseService):
             git bundle create changes.bundle HEAD --not refs/remotes/origin/<branch>
         """
         repo = _sanitize(data.get("repo", ""))
-        branch = _sanitize(data.get("branch", "main"))
+        branch = _sanitize_branch(data.get("branch", "main"))
         b64 = data.get("bundle_b64", "")
 
         # 1. Decode bundle
         try:
-            bundle_bytes = base64.b64decode(b64)
+            bundle_bytes = base64.b64decode(b64, validate=True)
         except Exception as e:
             return {"success": False, "output": f"Failed to decode bundle: {e}", "exit_code": -1}
 
@@ -263,8 +323,8 @@ class GitService(BaseService):
             #    The bundle contains refs/heads/<branch> with the client's commits
             log.info("Applying push bundle for %s/%s", repo, branch)
             fetch_result = subprocess.run(
-                f"git fetch {bundle_path} refs/heads/{branch}:refs/heads/{branch}",
-                shell=True, cwd=cache_dir, env=env,
+                ["git", "fetch", bundle_path, f"refs/heads/{branch}:refs/heads/{branch}"],
+                cwd=cache_dir, env=env,
                 capture_output=True, text=True, timeout=timeout,
             )
             if fetch_result.returncode != 0:
@@ -278,8 +338,8 @@ class GitService(BaseService):
             # 4. Push to origin
             log.info("Pushing %s/%s to origin", repo, branch)
             push_result = subprocess.run(
-                f"git push origin {branch}:{branch}",
-                shell=True, cwd=cache_dir, env=env,
+                ["git", "push", "origin", f"{branch}:{branch}"],
+                cwd=cache_dir, env=env,
                 capture_output=True, text=True, timeout=timeout,
             )
             output = (push_result.stdout or "") + (push_result.stderr or "")
@@ -309,14 +369,14 @@ class GitService(BaseService):
                 f"`{request_id[:16]}…`",
                 "",
                 f"📋 *Action:* `{action}`",
-                f"📦 *Repo:* `{data.get('repo')}`",
+                f"📦 *Repo:* {_md_code(data.get('repo'))}",
             ]
             if data.get("branch"):
-                lines.append(f"🌿 *Branch:* `{data['branch']}`")
+                lines.append(f"🌿 *Branch:* {_md_code(data['branch'])}")
             if data.get("known_ref"):
-                lines.append(f"🔖 *Known ref:* `{data['known_ref'][:12]}…`")
+                lines.append(f"🔖 *Known ref:* {_md_code(str(data['known_ref'])[:12] + '…')}")
             if data.get("details"):
-                lines.append(f"\n📝 *Details:*\n{data['details']}")
+                lines.append(f"\n📝 *Details:*\n{_md_escape(data['details'])}")
             return "\n".join(lines)
 
         elif action == "push-bundle":
@@ -325,12 +385,12 @@ class GitService(BaseService):
                 f"`{request_id[:16]}…`",
                 "",
                 f"📋 *Action:* `push changes`",
-                f"📦 *Repo:* `{data.get('repo')}`",
+                f"📦 *Repo:* {_md_code(data.get('repo'))}",
             ]
             if data.get("branch"):
-                lines.append(f"🌿 *Branch:* `{data['branch']}`")
+                lines.append(f"🌿 *Branch:* {_md_code(data['branch'])}")
             if data.get("details"):
-                lines.append(f"\n📝 *Details:*\n{data['details']}")
+                lines.append(f"\n📝 *Details:*\n{_md_escape(data['details'])}")
             return "\n".join(lines)
 
         # Fallback for legacy actions
@@ -339,16 +399,16 @@ class GitService(BaseService):
             f"`{request_id[:16]}…`",
             "",
             f"📋 *Action:* `{action}`",
-            f"📦 *Repo:* `{data.get('repo')}`",
+            f"📦 *Repo:* {_md_code(data.get('repo'))}",
         ]
         if data.get("branch"):
-            lines.append(f"🌿 *Branch:* `{data['branch']}`")
+            lines.append(f"🌿 *Branch:* {_md_code(data['branch'])}")
         if data.get("refspec"):
-            lines.append(f"📎 *Refspec:* `{data['refspec']}`")
+            lines.append(f"📎 *Refspec:* {_md_code(data['refspec'])}")
         if data.get("target_dir"):
-            lines.append(f"📁 *Target:* `{data['target_dir']}`")
+            lines.append(f"📁 *Target:* {_md_code(data['target_dir'])}")
         if data.get("workdir"):
-            lines.append(f"📁 *Workdir:* `{data['workdir']}`")
+            lines.append(f"📁 *Workdir:* {_md_code(data['workdir'])}")
         if data.get("details"):
-            lines.append(f"\n📝 *Details:*\n{data['details']}")
+            lines.append(f"\n📝 *Details:*\n{_md_escape(data['details'])}")
         return "\n".join(lines)

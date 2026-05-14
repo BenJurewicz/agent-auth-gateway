@@ -6,21 +6,17 @@ Holds no credentials. Sends operations to the proxy, which holds all
 service keys and requires Telegram approval before execution.
 
 Usage as CLI:
-    # Legacy: operations execute on the proxy
-    python auth-proxy-client.py gate git push --param repo=... --param workdir=... --details "..."
-    python auth-proxy-client.py gate git clone --param repo=... --param target-dir=...
-
     # Bundle transport: clone/fetch repos to the client machine
-    python auth-proxy-client.py pull git fetch-bundle \\
-        --param repo=git@github.com:user/repo.git \\
-        --param target-dir=/home/agent/projects/repo \\
-        --param branch=main \\
+    python auth-proxy-client.py fetch-bundle \\
+        --repo git@github.com:user/repo.git \\
+        --target-dir /home/agent/projects/repo \\
+        --branch main \\
         --details "Clone my repo"
 
-    python auth-proxy-client.py gate git push-bundle \\
-        --param repo=git@github.com:user/repo.git \\
-        --param workdir=/home/agent/projects/repo \\
-        --param branch=main \\
+    python auth-proxy-client.py push-bundle \\
+        --repo git@github.com:user/repo.git \\
+        --workdir /home/agent/projects/repo \\
+        --branch main \\
         --details "Pushing my changes"
 
     python auth-proxy-client.py health
@@ -233,7 +229,9 @@ class AuthProxyClient:
 
             if is_initial:
                 # First time: git clone from bundle
-                os.makedirs(os.path.dirname(target_dir), exist_ok=True)
+                parent_dir = os.path.dirname(target_dir)
+                if parent_dir:
+                    os.makedirs(parent_dir, exist_ok=True)
 
                 clone_result = subprocess.run(
                     ["git", "clone", bundle_path, target_dir],
@@ -299,6 +297,14 @@ class AuthProxyClient:
                 output = (fetch_result.stdout or "") + "\n" + (merge_result.stdout or "")
                 if merge_result.stderr:
                     output += "\n" + merge_result.stderr
+
+                if merge_result.returncode != 0:
+                    return {
+                        "success": False,
+                        "output": f"git merge failed:\n{output.strip()}",
+                        "exit_code": merge_result.returncode,
+                        "target_dir": target_dir,
+                    }
 
                 return {
                     "success": True,
