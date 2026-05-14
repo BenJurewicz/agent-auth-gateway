@@ -69,7 +69,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Optional
+from typing import Optional, Tuple
 from urllib import request as url_request
 from urllib.error import URLError
 
@@ -319,6 +319,43 @@ class AuthProxyClient:
 
     # ── Git service: Bundle transport (push from this machine) ───────────
 
+    def _git_push_base_ref(self, workdir: str, branch: str) -> Tuple[Optional[str], Optional[str]]:
+        """Return (base_ref, error) for an incremental push bundle."""
+        branch_ref = f"refs/heads/{branch}"
+        check_branch = subprocess.run(
+            ["git", "rev-parse", "--verify", "-q", branch_ref],
+            cwd=workdir, capture_output=True, timeout=10,
+        )
+        if check_branch.returncode != 0:
+            return None, f"Branch '{branch}' not found locally"
+
+        exact_remote_refs = [
+            f"refs/remotes/origin/{branch}",
+            f"refs/remotes/bundle-origin/{branch}",
+        ]
+        fallback_refs = [
+            "refs/remotes/origin/main",
+            "refs/remotes/bundle-origin/main",
+            "refs/remotes/origin/HEAD",
+        ]
+
+        for ref in exact_remote_refs + fallback_refs:
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", "-q", ref],
+                cwd=workdir, capture_output=True, timeout=10,
+            )
+            if check.returncode == 0:
+                if ref in exact_remote_refs:
+                    return ref, None
+                merge_base = subprocess.run(
+                    ["git", "merge-base", branch_ref, ref],
+                    cwd=workdir, capture_output=True, text=True, timeout=10,
+                )
+                if merge_base.returncode == 0:
+                    return merge_base.stdout.strip(), None
+
+        return None, None
+
     def git_push_bundle(
         self,
         repo: str,
@@ -345,38 +382,26 @@ class AuthProxyClient:
         if not os.path.isdir(os.path.join(workdir, ".git")):
             return {"success": False, "output": f"Not a git repo: {workdir}", "exit_code": -1}
 
-        # Determine base ref for the bundle (commits not yet in origin/<branch>)
-        # Try multiple possible remote tracking refs (origin, bundle-origin, then local branch)
-        candidate_refs = [
-            f"refs/remotes/origin/{branch}",
-            f"refs/remotes/bundle-origin/{branch}",
-            f"refs/heads/{branch}",
-        ]
-        base_ref = None
         try:
-            for ref in candidate_refs:
-                check = subprocess.run(
-                    ["git", "rev-parse", "--verify", "-q", ref],
-                    cwd=workdir, capture_output=True, timeout=10,
-                )
-                if check.returncode == 0:
-                    base_ref = ref
-                    break
+            base_ref, base_error = self._git_push_base_ref(workdir, branch)
         except Exception as e:
             return {"success": False, "output": f"Failed to check base ref: {e}", "exit_code": -1}
 
-        if not base_ref:
-            return {"success": False, "output": f"Branch '{branch}' not found locally (tried origin, bundle-origin, and local)", "exit_code": -1}
+        if base_error:
+            return {"success": False, "output": base_error, "exit_code": -1}
 
         # Create bundle
         fd, bundle_path = tempfile.mkstemp(suffix=".bundle", prefix="claw-push-")
         os.close(fd)
         try:
-            # Create an incremental bundle: only new commits since origin/<branch>
+            # Create an incremental bundle when we can identify a remote base.
+            # Brand-new branches may have no same-name remote tracking ref.
             bundle_cmd = [
                 "git", "bundle", "create", bundle_path,
-                f"refs/heads/{branch}", f"^{base_ref}",
+                f"refs/heads/{branch}",
             ]
+            if base_ref:
+                bundle_cmd.append(f"^{base_ref}")
             create_result = subprocess.run(
                 bundle_cmd, cwd=workdir,
                 capture_output=True, text=True, timeout=120,
