@@ -9,6 +9,7 @@ Supports git bundle transport for proxying repo data to/from the client:
     branch contents that the client can download and git-clone/git-fetch from.
   - push-bundle: Accept a base64-encoded bundle from the client, apply it to
     the bare cache, and push to origin.
+  - clear-cache: Remove all bare repo caches from the gateway.
 """
 
 import base64
@@ -110,6 +111,44 @@ def _cache_dir_for(repo: str) -> str:
     return os.path.join(CACHE_BASE, h)
 
 
+def _clear_cache_base() -> dict:
+    """Remove all cached bare repositories under CACHE_BASE."""
+    cache_base = os.path.abspath(CACHE_BASE)
+    if cache_base in ("/", ""):
+        raise RuntimeError("Refusing to clear unsafe cache directory")
+
+    if not os.path.exists(cache_base):
+        os.makedirs(cache_base, exist_ok=True)
+        return {"removed": 0, "bytes_removed": 0, "cache_dir": cache_base}
+
+    if not os.path.isdir(cache_base):
+        raise RuntimeError(f"Cache path is not a directory: {cache_base}")
+
+    removed = 0
+    bytes_removed = 0
+    for name in os.listdir(cache_base):
+        path = os.path.join(cache_base, name)
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                for filename in files:
+                    try:
+                        bytes_removed += os.path.getsize(os.path.join(root, filename))
+                    except OSError:
+                        pass
+            shutil.rmtree(path)
+            removed += 1
+        else:
+            try:
+                bytes_removed += os.path.getsize(path)
+            except OSError:
+                pass
+            os.unlink(path)
+            removed += 1
+
+    os.makedirs(cache_base, exist_ok=True)
+    return {"removed": removed, "bytes_removed": bytes_removed, "cache_dir": cache_base}
+
+
 def _ensure_cache(repo: str, config: dict) -> str:
     """Ensure a bare clone exists in the cache, update it, return its path."""
     cache_dir = _cache_dir_for(repo)
@@ -176,7 +215,7 @@ def _git_in_cache(cache_dir: str, *args: str, env: dict, timeout: int) -> subpro
 @service("git")
 class GitService(BaseService):
 
-    valid_actions = {"fetch-bundle", "push-bundle"}
+    valid_actions = {"fetch-bundle", "push-bundle", "clear-cache"}
 
     @classmethod
     def validate(cls, action: str, data: dict) -> None:
@@ -185,6 +224,9 @@ class GitService(BaseService):
                 f"Unsupported git action: '{action}'. "
                 f"Use: {', '.join(cls.valid_actions)}"
             )
+
+        if action == "clear-cache":
+            return
 
         repo = _sanitize(data.get("repo", ""))
         if not repo:
@@ -210,8 +252,28 @@ class GitService(BaseService):
             return cls._fetch_bundle(data, config, env, timeout)
         elif action == "push-bundle":
             return cls._push_bundle(data, config, env, timeout)
+        elif action == "clear-cache":
+            return cls._clear_cache(data, config)
         else:
             raise ValueError(f"Unsupported git action: '{action}'")
+
+    @classmethod
+    def _clear_cache(cls, data: dict, config: dict) -> dict:
+        """Remove all cached bare repositories from the gateway."""
+        try:
+            result = _clear_cache_base()
+        except Exception as e:
+            return {"success": False, "output": f"Failed to clear cache: {e}", "exit_code": -1}
+
+        return {
+            "success": True,
+            "output": (
+                f"Cleared git cache: removed {result['removed']} item(s), "
+                f"freed {result['bytes_removed']} bytes from {result['cache_dir']}"
+            ),
+            "exit_code": 0,
+            **result,
+        }
 
     # ── Bundle: clone/fetch via bundle ─────────────────────────────────────
 
@@ -389,6 +451,18 @@ class GitService(BaseService):
             ]
             if data.get("branch"):
                 lines.append(f"🌿 *Branch:* {_md_code(data['branch'])}")
+            if data.get("details"):
+                lines.append(f"\n📝 *Details:*\n{_md_escape(data['details'])}")
+            return "\n".join(lines)
+
+        elif action == "clear-cache":
+            lines = [
+                "🔐 *Auth Proxy — Git Clear Cache*",
+                f"`{request_id[:16]}…`",
+                "",
+                "📋 *Action:* `remove cached bare repos from gateway`",
+                f"🧹 *Cache:* {_md_code(CACHE_BASE)}",
+            ]
             if data.get("details"):
                 lines.append(f"\n📝 *Details:*\n{_md_escape(data['details'])}")
             return "\n".join(lines)
