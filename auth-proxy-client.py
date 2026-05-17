@@ -19,6 +19,9 @@ Usage as CLI:
         --branch main \\
         --details "Pushing my changes"
 
+    python auth-proxy-client.py git-clear-cache \\
+        --details "Remove cached gateway repos"
+
     python auth-proxy-client.py health
 
     # GitHub — list repos (no approval needed)
@@ -47,6 +50,8 @@ Usage as library:
     # Bundle transport (push from this machine through gateway)
     proxy.git_push_bundle(repo="git@github.com:user/repo.git", workdir="/path",
                           branch="main", details="My update")
+
+    proxy.git_clear_cache(details="Remove cached gateway repos")
 
     # GitHub API (no git involved)
     result = proxy.github_list_repos(filter="agent-auth")
@@ -444,6 +449,10 @@ class AuthProxyClient:
             "bundle_b64": b64,
         }, details)
 
+    def git_clear_cache(self, details: str = "") -> dict:
+        """Clear all cached bare repos stored on the gateway."""
+        return self._gate("git", "clear-cache", {}, details)
+
     # ── GitHub service ─────────────────────────────────────────────────
 
     def github_list_repos(
@@ -610,6 +619,14 @@ def cli() -> None:
     p_push.add_argument("--timeout", type=int, default=0,
                         help="Override request timeout in seconds")
 
+    # ── git clear-cache ────────────────────────────────────────────────
+    p_git_clear = sub.add_parser("git-clear-cache",
+        help="Clear cached bare repositories from the gateway")
+    p_git_clear.add_argument("--details", "-d", default="",
+        help="Human-readable context for approval prompt")
+    p_git_clear.add_argument("--timeout", type=int, default=0,
+        help="Override request timeout in seconds")
+
     # ── github list-repos ──────────────────────────────────────────────
     p_gh_list = sub.add_parser("github-list-repos",
         help="List GitHub repositories (no approval needed)")
@@ -719,6 +736,15 @@ def cli() -> None:
             workdir=args.workdir,
             branch=args.branch,
             details=args.details,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── git-clear-cache ────────────────────────────────────────────────
+    elif args.command == "git-clear-cache":
+        client.timeout = timeout or 600
+        result = client.git_clear_cache(
+            details=args.details or "Clear cached bare repos from the auth gateway",
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)

@@ -166,6 +166,23 @@ class GitPushBundleTests(unittest.TestCase):
 
 
 class GitServiceTests(unittest.TestCase):
+    def test_clear_cache_allows_no_repo_and_removes_cache_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "cache"
+            repo_cache = cache / "repo.git"
+            repo_cache.mkdir(parents=True)
+            (repo_cache / "HEAD").write_text("ref: refs/heads/main\n")
+            (cache / "leftover.bundle").write_text("temporary bundle\n")
+
+            with mock.patch.object(git_service, "CACHE_BASE", str(cache)):
+                git_service.GitService.validate("clear-cache", {})
+                result = git_service.GitService.execute("clear-cache", {}, {})
+
+            self.assertTrue(result["success"], result["output"])
+            self.assertEqual(result["removed"], 2)
+            self.assertTrue(cache.is_dir())
+            self.assertEqual(list(cache.iterdir()), [])
+
     def test_validate_rejects_invalid_branch_and_known_ref(self):
         with self.assertRaises(ValueError):
             git_service.GitService.validate("fetch-bundle", {

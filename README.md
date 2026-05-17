@@ -39,6 +39,7 @@ privileged operation.
 |---------|----------|--------------------------------------------------|
 | `git`   | `fetch-bundle` | Download a git bundle for local clone/fetch |
 | `git`   | `push-bundle`  | Upload a local git bundle and push it       |
+| `git`   | `clear-cache`  | Remove all cached bare repos from the gateway |
 | `github` | `list-repos` | List repositories visible to the GitHub token |
 | `github` | `create-repo` | Create a GitHub repository                  |
 | `github` | `create-pr`   | Create a GitHub pull request                |
@@ -322,6 +323,9 @@ python auth-proxy-client.py push-bundle \
     --workdir /home/agent/projects/my-project \
     --branch main \
     --details "Auto-generated feature X"
+
+python auth-proxy-client.py git-clear-cache \
+    --details "Remove cached gateway repos"
 
 # GitHub API
 python auth-proxy-client.py github-list-repos --filter my-project
