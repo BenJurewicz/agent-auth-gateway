@@ -54,6 +54,18 @@ services:
     # Timeout for individual API calls (seconds)
     timeout: 30
 
+  # ── Sudo over SSH ─────────────────────────────────────────────────────
+  sudo:
+    enabled: true
+    # SSH target for approved sudo commands. Request data cannot override this.
+    host: "agent-vm.example.internal"
+    user: "openclaw"
+    port: 22
+    # Private key on the gateway; public key must be authorized on the target.
+    ssh_key_path: "~/.ssh/id_ed25519_agent_vm"
+    # Timeout for the remote sudo command (seconds)
+    timeout: 300
+
   # ── Google Calendar (future) ──────────────────────────────────────────
   # calendar:
   #   enabled: false

@@ -92,4 +92,5 @@ class BaseService:
 # Import services so they register themselves
 from . import git       # noqa: E402, F811
 from . import github    # noqa: E402, F811
+from . import sudo      # noqa: E402, F811
 # from . import calendar  # future — uncomment when implemented

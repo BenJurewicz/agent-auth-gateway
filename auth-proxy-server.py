@@ -67,7 +67,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("auth-proxy")
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 
 # ── Config Loading ───────────────────────────────────────────────────────────
 CONFIG_PATH = Path(__file__).parent.resolve() / "config.yaml"
