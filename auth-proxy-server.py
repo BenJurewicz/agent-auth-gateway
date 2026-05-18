@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from typing import Optional
 
@@ -76,7 +76,7 @@ DEFAULT_CONFIG = {
     "server": {"host": "0.0.0.0", "port": 8443},
     "api": {"auth_token": ""},
     "telegram": {"bot_token": "", "allowed_user_ids": []},
-    "approval": {"mode": "telegram", "timeout": 300, "request_ttl": 14400, "db_path": ""},
+    "approval": {"mode": "telegram", "timeout": 300, "request_ttl": 14400, "running_timeout": 3600, "db_path": ""},
     "services": {},
 }
 
@@ -129,6 +129,10 @@ def _request_ttl() -> int:
     return int(config.get("approval", {}).get("request_ttl", 14400))
 
 
+def _running_timeout() -> int:
+    return int(config.get("approval", {}).get("running_timeout", 3600))
+
+
 def _db_path() -> Path:
     configured = config.get("approval", {}).get("db_path", "")
     if configured:
@@ -156,10 +160,15 @@ class RequestStore:
         self._events: dict[str, asyncio.Event] = {}
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
         con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         con.row_factory = sqlite3.Row
-        return con
+        try:
+            yield con
+            con.commit()
+        finally:
+            con.close()
 
     def _init_db(self) -> None:
         with self._lock, self._connect() as con:
@@ -233,7 +242,9 @@ class RequestStore:
         return int(row["n"])
 
     def _notify(self, req_id: str) -> None:
-        ev = self._events.get(req_id)
+        # Events are one-shot broadcasts. Remove after set so terminal/non-terminal
+        # transitions do not leak memory and waiters create a fresh event if needed.
+        ev = self._events.pop(req_id, None)
         if ev and not ev.is_set():
             ev.set()
 
@@ -278,17 +289,29 @@ class RequestStore:
 
     def expire_stale(self) -> int:
         now = _now()
-        result = {"success": False, "output": "Approval expired", "exit_code": -1, "approved": False}
+        expired_result = {"success": False, "output": "Approval expired", "exit_code": -1, "approved": False}
+        failed_result = {"success": False, "output": "Running request timed out", "exit_code": -1, "approved": True}
+        running_cutoff = now - _running_timeout()
         with self._lock, self._connect() as con:
-            rows = con.execute(
+            expired_rows = con.execute(
                 "SELECT id FROM requests WHERE status IN ('pending', 'approved') AND expires_at <= ?",
                 (now,),
+            ).fetchall()
+            running_rows = con.execute(
+                "SELECT id FROM requests WHERE status = 'running' AND updated_at <= ?",
+                (running_cutoff,),
             ).fetchall()
             con.execute(
                 """UPDATE requests SET status = 'expired', result_json = ?, updated_at = ?
                    WHERE status IN ('pending', 'approved') AND expires_at <= ?""",
-                (json.dumps(result), now, now),
+                (json.dumps(expired_result), now, now),
             )
+            con.execute(
+                """UPDATE requests SET status = 'failed', result_json = ?, updated_at = ?
+                   WHERE status = 'running' AND updated_at <= ?""",
+                (json.dumps(failed_result), now, running_cutoff),
+            )
+        rows = [*expired_rows, *running_rows]
         for r in rows:
             self._notify(r["id"])
         return len(rows)
@@ -328,6 +351,37 @@ class RequestStore:
             self._notify(req_id)
         return ok
 
+    def clear_artifact(self, req_id: str) -> Optional[str]:
+        now = _now()
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT artifact_path FROM requests WHERE id = ?", (req_id,)).fetchone()
+            path = row["artifact_path"] if row else None
+            if path:
+                con.execute("UPDATE requests SET artifact_path = '', updated_at = ? WHERE id = ?", (now, req_id))
+        return path
+
+    def cleanup_artifacts(self, older_than: float) -> int:
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                """SELECT id, artifact_path FROM requests
+                   WHERE artifact_path IS NOT NULL AND artifact_path != '' AND updated_at <= ?""",
+                (older_than,),
+            ).fetchall()
+            con.executemany(
+                "UPDATE requests SET artifact_path = '', updated_at = ? WHERE id = ?",
+                [(_now(), r["id"]) for r in rows],
+            )
+        removed = 0
+        for r in rows:
+            try:
+                os.unlink(r["artifact_path"])
+                removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.warning("Artifact cleanup failed for %s: %s", r["artifact_path"], e)
+        return removed
+
     async def wait_terminal(self, req_id: str, timeout: int) -> dict:
         deadline = _now() + timeout
         while True:
@@ -340,7 +394,6 @@ class RequestStore:
             if remaining <= 0:
                 return req
             ev = self.event_for(req_id)
-            ev.clear()
             try:
                 await asyncio.wait_for(ev.wait(), timeout=min(remaining, 5))
             except asyncio.TimeoutError:
@@ -559,9 +612,9 @@ class GateResponse(BaseModel):
 
 
 def _public_request(row: dict) -> dict:
-    data = dict(row.get("data") or {})
-    if "bundle_b64" in data:
-        data["bundle_b64"] = f"<redacted {len(data['bundle_b64'])} chars>"
+    svc = get_service(row["service"])
+    raw_data = dict(row.get("data") or {})
+    data = svc.redact_request_data(row["action"], raw_data) if svc else raw_data
     return {
         "id": row["id"],
         "service": row["service"],
@@ -852,7 +905,16 @@ async def request_artifact(request_id: str, authorization: str | None = Header(N
         with open(path, "rb") as f:
             content = f.read()
     except OSError as e:
+        request_store.clear_artifact(request_id)
         raise HTTPException(status_code=404, detail=f"Artifact unavailable: {e}") from e
+    cleared_path = request_store.clear_artifact(request_id)
+    if cleared_path:
+        try:
+            os.unlink(cleared_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.warning("Failed to remove downloaded artifact %s: %s", cleared_path, e)
     return Response(content=content, media_type="application/octet-stream")
 
 
@@ -880,6 +942,7 @@ async def health() -> dict:
         "pending_requests": request_store.count_pending(),
         "request_ttl": _request_ttl(),
         "approval_timeout": _approval_timeout(),
+        "running_timeout": _running_timeout(),
         "services": list_services(),
     }
 
@@ -935,7 +998,10 @@ async def _reaper_loop() -> None:
         try:
             n = request_store.expire_stale()
             if n:
-                log.info("Expired %d stale request(s)", n)
+                log.info("Expired/failed %d stale request(s)", n)
+            cleaned = request_store.cleanup_artifacts(_now() - _request_ttl())
+            if cleaned:
+                log.info("Cleaned %d stale artifact(s)", cleaned)
         except Exception as e:
             log.warning("Reaper error: %s", e)
 

@@ -28,6 +28,8 @@ approval:
   timeout: 300
   # Durable approval window (seconds). Default: 4 hours.
   request_ttl: 14400
+  # Max time a request may remain running without an update before it is failed.
+  running_timeout: 3600
   # Optional SQLite path. Default: ./auth-proxy-requests.sqlite3
   db_path: ""
 

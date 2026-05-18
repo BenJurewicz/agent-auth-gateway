@@ -125,6 +125,13 @@ class GitHubService(BaseService):
     def requires_approval(cls, action: str) -> bool:
         return action != "list-repos"
 
+    @classmethod
+    def redact_request_data(cls, action: str, data: dict) -> dict:
+        redacted = super().redact_request_data(action, data)
+        if action == "create-pr" and "body" in redacted:
+            redacted["body"] = f"<redacted {len(str(data.get('body', '')))} chars>"
+        return redacted
+
     # ── Execute ────────────────────────────────────────────────────────
 
     @classmethod

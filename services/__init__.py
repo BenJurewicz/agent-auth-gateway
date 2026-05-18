@@ -72,6 +72,22 @@ class BaseService:
         """
         return True
 
+    @classmethod
+    def redact_request_data(cls, action: str, data: dict) -> dict:
+        """Return a safe-to-display copy of queued request data.
+
+        Services can override this to hide action-specific fields. The default
+        redacts commonly sensitive key names and large binary payload fields.
+        """
+        redacted = {}
+        sensitive_markers = ("token", "secret", "password", "key", "credential", "bundle_b64")
+        for key, value in (data or {}).items():
+            if any(marker in key.lower() for marker in sensitive_markers):
+                redacted[key] = f"<redacted {len(str(value))} chars>"
+            else:
+                redacted[key] = value
+        return redacted
+
 
 # Import services so they register themselves
 from . import git       # noqa: E402, F811
