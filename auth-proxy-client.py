@@ -133,13 +133,13 @@ class AuthProxyClient:
             {"params": params, "details": details, "async_request": async_request},
         )
 
-    def _gate_pull(self, service: str, action: str, params: dict, details: str = "", async_request: bool = False) -> bytes:
+    def _gate_pull(self, service: str, action: str, params: dict, details: str = "") -> bytes:
         """Low-level: send a gated operation to the binary-download endpoint.
 
         Returns the raw bytes of the response body.
         """
         url = f"{self.proxy_url}/gate/pull/{service}/{action}"
-        body = json.dumps({"params": params, "details": details, "async_request": async_request}).encode("utf-8")
+        body = json.dumps({"params": params, "details": details, "async_request": False}).encode("utf-8")
 
         req = url_request.Request(
             url, data=body,

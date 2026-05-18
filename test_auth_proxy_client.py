@@ -283,6 +283,17 @@ class RequestQueueTests(unittest.TestCase):
             self.assertEqual(final["status"], "cancelled")
             self.assertFalse(final["result"]["success"])
 
+    def test_events_are_removed_after_notification(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            row = store.create("git", "clear-cache", {"details": "test"})
+            event = store.event_for(row["id"])
+
+            self.assertIn(row["id"], store._events)
+            self.assertTrue(store.approve(row["id"], approved_by="tester"))
+            self.assertTrue(event.is_set())
+            self.assertNotIn(row["id"], store._events)
+
     def test_durable_store_expires_stale_pending_requests(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "requests.sqlite3"
@@ -295,6 +306,35 @@ class RequestQueueTests(unittest.TestCase):
             expired = store.get(row["id"])
             self.assertEqual(expired["status"], "expired")
             self.assertFalse(expired["result"]["success"])
+
+    def test_stale_running_request_is_failed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            row = store.create("git", "clear-cache", {"details": "test"}, status="approved")
+            claimed = store.claim_next_approved()
+            with store._connect() as con:
+                con.execute("UPDATE requests SET updated_at = ? WHERE id = ?", (0, claimed["id"]))
+
+            with mock.patch.object(auth_proxy_server, "_running_timeout", return_value=1):
+                self.assertEqual(store.expire_stale(), 1)
+
+            failed = store.get(row["id"])
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("Running request timed out", failed["result"]["output"])
+
+    def test_cleanup_artifacts_removes_old_files_and_db_references(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            artifact = Path(tmp) / "old.bundle"
+            artifact.write_bytes(b"old")
+            row = store.create("git", "clear-cache", {"details": "test"}, status="approved")
+            store.finish(row["id"], "succeeded", {"success": True, "output": "ok", "exit_code": 0}, artifact_path=str(artifact))
+            with store._connect() as con:
+                con.execute("UPDATE requests SET updated_at = ? WHERE id = ?", (0, row["id"]))
+
+            self.assertEqual(store.cleanup_artifacts(older_than=1), 1)
+            self.assertFalse(artifact.exists())
+            self.assertFalse(store.get(row["id"])["artifact_path"])
 
     def test_execute_request_preserves_binary_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,6 +359,17 @@ class RequestQueueTests(unittest.TestCase):
             self.assertEqual(Path(artifact_path).read_bytes(), b"bundle-data")
             self.assertFalse(artifact.exists())
 
+    def test_clear_artifact_returns_path_and_removes_db_reference(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            artifact = Path(tmp) / "bundle"
+            artifact.write_bytes(b"data")
+            row = store.create("git", "clear-cache", {"details": "test"}, status="approved")
+            store.finish(row["id"], "succeeded", {"success": True, "output": "ok", "exit_code": 0}, artifact_path=str(artifact))
+
+            self.assertEqual(store.clear_artifact(row["id"]), str(artifact))
+            self.assertFalse(store.get(row["id"])["artifact_path"])
+
     def test_public_request_redacts_push_bundle_payload(self):
         public = auth_proxy_server._public_request({
             "id": "req",
@@ -338,6 +389,26 @@ class RequestQueueTests(unittest.TestCase):
 
         self.assertEqual(public["data"]["bundle_b64"], "<redacted 6 chars>")
         self.assertEqual(public["data"]["branch"], "main")
+
+    def test_public_request_uses_service_redaction_for_github_body(self):
+        public = auth_proxy_server._public_request({
+            "id": "req",
+            "service": "github",
+            "action": "create-pr",
+            "status": "pending",
+            "created_at": 1,
+            "updated_at": 1,
+            "expires_at": 2,
+            "approved_by": None,
+            "approved_at": None,
+            "expired": False,
+            "data": {"title": "PR", "body": "sensitive body"},
+            "result": None,
+            "artifact_path": "",
+        })
+
+        self.assertEqual(public["data"]["title"], "PR")
+        self.assertEqual(public["data"]["body"], "<redacted 14 chars>")
 
 
 class GitServiceTests(unittest.TestCase):

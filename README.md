@@ -226,6 +226,7 @@ approval:
   mode: "telegram"                       # "telegram" | "console" | "auto"
   timeout: 300                           # Blocking-client wait timeout
   request_ttl: 14400                     # Durable approval window, default 4h
+  running_timeout: 3600                  # Fail zombie running requests after 1h
   db_path: ""                            # Optional SQLite path
 
 services:
@@ -462,6 +463,7 @@ Content-Type: application/json
   "pending_requests": 0,
   "request_ttl": 14400,
   "approval_timeout": 300,
+  "running_timeout": 3600,
   "services": ["git", "github"]
 }
 ```
