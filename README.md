@@ -224,7 +224,9 @@ telegram:
 
 approval:
   mode: "telegram"                       # "telegram" | "console" | "auto"
-  timeout: 300                           # Seconds before request expires
+  timeout: 300                           # Blocking-client wait timeout
+  request_ttl: 14400                     # Durable approval window, default 4h
+  db_path: ""                            # Optional SQLite path
 
 services:
   git:
@@ -281,7 +283,9 @@ result = proxy.git_push_bundle(
     workdir="/home/agent/projects/my-project",
     branch="main",
     details="Auto-generated feature X",
+    async_request=True,  # returns immediately with request_id
 )
+status = proxy.request_status(result["request_id"])
 
 # ── Any service (generic) ──
 result = proxy.gate("git", "push-bundle", {
@@ -322,7 +326,8 @@ python auth-proxy-client.py push-bundle \
     --repo git@github.com:user/my-project.git \
     --workdir /home/agent/projects/my-project \
     --branch main \
-    --details "Auto-generated feature X"
+    --details "Auto-generated feature X" \
+    --async
 
 python auth-proxy-client.py git-clear-cache \
     --details "Remove cached gateway repos"
@@ -331,7 +336,14 @@ python auth-proxy-client.py git-clear-cache \
 python auth-proxy-client.py github-list-repos --filter my-project
 python auth-proxy-client.py github-create-pr \
     --owner user --repo my-project \
-    --title "Add feature" --head feature-branch --base main
+    --title "Add feature" --head feature-branch --base main \
+    --async
+
+# Queue management
+python auth-proxy-client.py request-status req_abc123
+python auth-proxy-client.py requests-list --status pending
+python auth-proxy-client.py request-cancel req_abc123
+python auth-proxy-client.py requests-expire-stale
 
 # Health check
 python auth-proxy-client.py health
@@ -347,7 +359,8 @@ python auth-proxy-client.py health
   "approved": true,
   "request_id": "abc123def456...",
   "service": "git",
-  "action": "push"
+  "action": "push",
+  "status": "succeeded"
 }
 ```
 
@@ -360,6 +373,7 @@ python auth-proxy-client.py health
 | `request_id` | string | Unique request identifier               |
 | `service`    | string | Service name (e.g. "git")               |
 | `action`     | string | Action name (e.g. "push")               |
+| `status`     | string | Queue status (`pending`, `running`, etc.) |
 
 ## Approval Flow
 
@@ -373,10 +387,13 @@ When the AI agent sends an operation:
 
 2. **The user taps** ✅ Approve or ❌ Deny
 
-3. **If approved:** the proxy executes the operation with the stored credential.
-   **If denied:** the agent gets an error response.
+3. **If approved:** the proxy marks the durable SQLite request as `approved`.
 
-4. The request expires after 5 minutes (configurable).
+4. A background worker executes approved requests and stores the result. The original HTTP request does not need to still be alive.
+
+5. The agent can keep working and later call `request-status`, `requests-list`, or `request-cancel`.
+
+6. Pending requests expire after `approval.request_ttl` (default 4 hours). Blocking clients only wait for `approval.timeout`.
 
 ## Security
 
@@ -421,19 +438,30 @@ Content-Type: application/json
     "repo": "git@github.com:user/my-project.git",
     "branch": "main"
   },
-  "details": "Auto-generated code for issue #42"
+  "details": "Auto-generated code for issue #42",
+  "async_request": true
 }
 ```
 
 **Response:** See [Response Format](#response-format) above.
+
+### Queue endpoints
+
+- `GET /requests?status=pending&limit=50`
+- `GET /requests/{request_id}`
+- `POST /requests/{request_id}/cancel`
+- `POST /requests/expire-stale`
+- `GET /requests/{request_id}/artifact` for async binary results
 
 ### GET /health
 
 ```json
 {
   "status": "ok",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "pending_requests": 0,
+  "request_ttl": 14400,
+  "approval_timeout": 300,
   "services": ["git", "github"]
 }
 ```

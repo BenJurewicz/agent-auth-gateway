@@ -2,9 +2,12 @@
 
 import base64
 import importlib.util
+import json
 import os
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from unittest import mock
 from pathlib import Path
@@ -17,6 +20,58 @@ SPEC = importlib.util.spec_from_file_location("auth_proxy_client", CLIENT_PATH)
 auth_proxy_client = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(auth_proxy_client)
 AuthProxyClient = auth_proxy_client.AuthProxyClient
+
+# The server module is tested for queue internals without requiring FastAPI
+# or python-telegram-bot in the local unit-test environment.
+if "fastapi" not in sys.modules:
+    fake_fastapi = types.ModuleType("fastapi")
+
+    class FakeHTTPException(Exception):
+        def __init__(self, status_code=500, detail=""):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    class FakeResponse:
+        def __init__(self, content=b"", media_type="", status_code=200, headers=None):
+            self.content = content
+            self.media_type = media_type
+            self.status_code = status_code
+            self.headers = headers or {}
+
+    class FakeFastAPI:
+        def __init__(self, *args, **kwargs):
+            pass
+        def post(self, *args, **kwargs):
+            return lambda fn: fn
+        def get(self, *args, **kwargs):
+            return lambda fn: fn
+
+    fake_fastapi.FastAPI = FakeFastAPI
+    fake_fastapi.HTTPException = FakeHTTPException
+    fake_fastapi.Header = lambda default=None: default
+    fake_fastapi.Request = object
+    fake_fastapi.Response = FakeResponse
+    sys.modules["fastapi"] = fake_fastapi
+
+if "uvicorn" not in sys.modules:
+    fake_uvicorn = types.ModuleType("uvicorn")
+    fake_uvicorn.run = lambda *args, **kwargs: None
+    sys.modules["uvicorn"] = fake_uvicorn
+
+try:
+    import pydantic  # noqa: F401
+except Exception:
+    fake_pydantic = types.ModuleType("pydantic")
+    class FakeBaseModel:
+        pass
+    fake_pydantic.BaseModel = FakeBaseModel
+    sys.modules["pydantic"] = fake_pydantic
+
+SERVER_PATH = Path(__file__).with_name("auth-proxy-server.py")
+SERVER_SPEC = importlib.util.spec_from_file_location("auth_proxy_server", SERVER_PATH)
+auth_proxy_server = importlib.util.module_from_spec(SERVER_SPEC)
+SERVER_SPEC.loader.exec_module(auth_proxy_server)
 
 
 def run_git(args, cwd, **kwargs):
@@ -32,7 +87,7 @@ def run_git(args, cwd, **kwargs):
 
 
 class CapturingClient(AuthProxyClient):
-    def _gate(self, service, action, params, details=""):
+    def _gate(self, service, action, params, details="", async_request=False):
         bundle = base64.b64decode(params["bundle_b64"])
         with tempfile.NamedTemporaryFile(suffix=".bundle") as tmp:
             tmp.write(bundle)
@@ -55,6 +110,34 @@ class BundleServingClient(AuthProxyClient):
 
     def _gate_pull(self, service, action, params, details=""):
         return self.bundle_path.read_bytes()
+
+
+class ClientQueueTests(unittest.TestCase):
+    def test_gate_sends_async_request_flag(self):
+        captured = {}
+
+        class FakeResponse:
+            def read(self):
+                return b'{"success": true, "request_id": "req123", "status": "pending"}'
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["timeout"] = timeout
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            captured["auth"] = req.headers.get("Authorization")
+            return FakeResponse()
+
+        with mock.patch.object(auth_proxy_client.url_request, "urlopen", side_effect=fake_urlopen):
+            result = AuthProxyClient("http://proxy", "secret", timeout=7).gate(
+                "github", "create-pr", {"repo": "r"}, "details", async_request=True,
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["url"], "http://proxy/gate/github/create-pr")
+        self.assertEqual(captured["timeout"], 7)
+        self.assertEqual(captured["auth"], "Bearer secret")
+        self.assertTrue(captured["body"]["async_request"])
+        self.assertEqual(captured["body"]["details"], "details")
 
 
 class GitPushBundleTests(unittest.TestCase):
@@ -163,6 +246,98 @@ class GitPushBundleTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertNotEqual(result["exit_code"], 0)
         self.assertIn("git merge failed", result["output"])
+
+
+class RequestQueueTests(unittest.TestCase):
+    def test_durable_store_approve_claim_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            row = store.create("git", "clear-cache", {"details": "test"})
+
+            self.assertEqual(row["status"], "pending")
+            self.assertTrue(store.approve(row["id"], approved_by="tester"))
+
+            claimed = store.claim_next_approved()
+            self.assertIsNotNone(claimed)
+            self.assertEqual(claimed["status"], "running")
+
+            result = {"success": True, "output": "done", "exit_code": 0}
+            self.assertTrue(store.finish(row["id"], "succeeded", result))
+
+            final = store.get(row["id"])
+            self.assertEqual(final["status"], "succeeded")
+            self.assertEqual(final["result"], result)
+
+    def test_cancelled_request_is_not_overwritten_by_late_worker_finish(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = auth_proxy_server.RequestStore(Path(tmp) / "requests.sqlite3")
+            row = store.create("git", "clear-cache", {"details": "test"}, status="approved")
+            claimed = store.claim_next_approved()
+            self.assertEqual(claimed["status"], "running")
+
+            self.assertTrue(store.cancel(row["id"]))
+            late_result = {"success": True, "output": "late success", "exit_code": 0}
+            self.assertFalse(store.finish(row["id"], "succeeded", late_result))
+
+            final = store.get(row["id"])
+            self.assertEqual(final["status"], "cancelled")
+            self.assertFalse(final["result"]["success"])
+
+    def test_durable_store_expires_stale_pending_requests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "requests.sqlite3"
+            store = auth_proxy_server.RequestStore(db)
+            row = store.create("git", "clear-cache", {"details": "test"})
+            with store._connect() as con:
+                con.execute("UPDATE requests SET expires_at = ? WHERE id = ?", (0, row["id"]))
+
+            self.assertEqual(store.expire_stale(), 1)
+            expired = store.get(row["id"])
+            self.assertEqual(expired["status"], "expired")
+            self.assertFalse(expired["result"]["success"])
+
+    def test_execute_request_preserves_binary_artifact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact = Path(tmp) / "source.bundle"
+            artifact.write_bytes(b"bundle-data")
+            row = {
+                "id": "reqtestartifact",
+                "service": "git",
+                "action": "clear-cache",
+                "data": {},
+            }
+            with mock.patch.object(git_service.GitService, "execute", return_value={
+                "success": True,
+                "output": "ok",
+                "exit_code": 0,
+                "_binary_file": str(artifact),
+            }), mock.patch.object(auth_proxy_server, "_artifact_dir", return_value=Path(tmp) / "artifacts"):
+                result, artifact_path = auth_proxy_server._execute_request_sync(row)
+
+            self.assertTrue(result["success"])
+            self.assertTrue(Path(artifact_path).is_file())
+            self.assertEqual(Path(artifact_path).read_bytes(), b"bundle-data")
+            self.assertFalse(artifact.exists())
+
+    def test_public_request_redacts_push_bundle_payload(self):
+        public = auth_proxy_server._public_request({
+            "id": "req",
+            "service": "git",
+            "action": "push-bundle",
+            "status": "pending",
+            "created_at": 1,
+            "updated_at": 1,
+            "expires_at": 2,
+            "approved_by": None,
+            "approved_at": None,
+            "expired": False,
+            "data": {"bundle_b64": "abc123", "branch": "main"},
+            "result": None,
+            "artifact_path": "",
+        })
+
+        self.assertEqual(public["data"]["bundle_b64"], "<redacted 6 chars>")
+        self.assertEqual(public["data"]["branch"], "main")
 
 
 class GitServiceTests(unittest.TestCase):

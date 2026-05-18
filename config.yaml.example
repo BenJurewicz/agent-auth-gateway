@@ -23,8 +23,13 @@ telegram:
 approval:
   # Mode: "telegram" (send via Telegram), "console" (stdin), "auto" (no approval)
   mode: "telegram"
-  # Timeout for user to approve (seconds)
+  # Blocking-client wait timeout (seconds). This is intentionally short-ish:
+  # async requests keep waiting in the durable queue after HTTP returns.
   timeout: 300
+  # Durable approval window (seconds). Default: 4 hours.
+  request_ttl: 14400
+  # Optional SQLite path. Default: ./auth-proxy-requests.sqlite3
+  db_path: ""
 
 services:
   # ── Git / GitHub ──────────────────────────────────────────────────────
