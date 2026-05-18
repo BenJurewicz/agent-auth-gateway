@@ -7,23 +7,13 @@ privileged operation.
 
 ## Architecture
 
-```
- ┌─────────────────────────┐   POST /gate/{svc}/{act}   ┌──────────────────────────┐
- │   AI Agent (remote VM)  │ ─────────────────────────▶  │  Auth Proxy (gate host)  │
- │                         │                            │                          │
- │  - Has no credentials   │  ◀────────────────────────  │  - Holds ALL credentials │
- │  - Delegates to proxy   │   {success, output, ...}   │  - Service plugin system │
- │  - Receives results     │                            │  - Request store + auth  │
- └─────────────────────────┘                            └──────────┬───────────────┘
-                                                                   │
-                                                    ┌──────────────┴───────────────┐
-                                                    │        Telegram Bot          │
-                                                    │                              │
-                                                    │  "git push to repo/main?     │
-                                                    │   [✅ Approve]  [❌ Deny]    │
-                                                    │                              │
-                                                    │       Authorized User        │
-                                                    └──────────────────────────────┘
+![Auth Proxy architecture](docs/auth-proxy-architecture.svg)
+
+The source for this generated figure lives at [`docs/auth-proxy-architecture.dot`](docs/auth-proxy-architecture.dot).
+Regenerate it with:
+
+```bash
+fig graph docs/auth-proxy-architecture.dot --format svg -o docs/auth-proxy-architecture.svg
 ```
 
 **Key security properties:**
@@ -31,6 +21,7 @@ privileged operation.
 - Credentials **never leave** the gate machine.
 - The AI agent cannot bypass approval — it doesn't have the keys.
 - Each operation shows enough context to make an informed decision.
+- Requests are durable: short-lived clients can reconnect and inspect status/results later.
 - Adding a new service is a single file: subclass `BaseService`, add `@service("name")`.
 
 ## Supported Services
@@ -50,7 +41,8 @@ The `sudo` service only accepts commands that start with `sudo`; SSH target, use
 port, and key are configured on the gateway and cannot be overridden by requests.
 It parses the request with `shlex`, re-quotes argv before crossing the SSH remote
 shell boundary, requires an explicit dedicated SSH key, and denies common shell-
-spawning programs by default.
+spawning programs by default. Treat it as an approval path for narrow operational
+tasks, not as a general remote shell.
 
 ## Adding a New Service
 
@@ -432,7 +424,7 @@ When the AI agent sends an operation:
 
 - **Credential exfiltration:** Keys never leave the Proxmox machine.
 - **Unauthorized operations:** Every operation requires Telegram approval.
-- **Shell injection:** Parameters are validated against a character blacklist.
+- **Shell injection:** Git parameters are validated and sudo commands are parsed/re-quoted before SSH execution.
 - **MITM:** API token sent as Bearer. Run both on the same VLAN/VPN for extra security.
 - **Bypass via direct access:** The AI agent doesn't have any keys. Even if the agent is compromised, the attacker can't act without approval.
 
@@ -489,12 +481,12 @@ Content-Type: application/json
 ```json
 {
   "status": "ok",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "pending_requests": 0,
   "request_ttl": 14400,
   "approval_timeout": 300,
   "running_timeout": 3600,
-  "services": ["git", "github"]
+  "services": ["git", "github", "sudo"]
 }
 ```
 
