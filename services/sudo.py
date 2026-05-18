@@ -1,10 +1,9 @@
 """
-Sudo Service — approved sudo command execution over SSH.
+Sudo Service — approved command execution over SSH.
 
 The gateway holds an SSH key that is authorized on the target agent machine.
-A client submits the exact sudo command it wants to run, the gateway asks for
-Telegram approval, and after approval executes that exact command on the
-configured target via SSH.
+A client submits the sudo command it wants to run, the gateway asks for Telegram
+approval, and after approval executes it on the configured target via SSH.
 
 Configuration lives under services.sudo. Request data cannot override the SSH
 host/user/key; the gateway operator controls the target.
@@ -14,10 +13,21 @@ import logging
 import os
 import shlex
 import subprocess
+from pathlib import PurePosixPath
 
 from . import BaseService, service
 
 log = logging.getLogger("auth-proxy.sudo")
+
+SUDO_BINARIES = {"sudo", "/usr/bin/sudo", "/bin/sudo"}
+SUDO_OPTIONS_WITH_VALUE = {"-A", "-b", "-C", "-c", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-U", "-u"}
+DEFAULT_DENIED_COMMANDS = {
+    "bash", "dash", "fish", "ksh", "sh", "tcsh", "zsh",
+    "vi", "vim", "nvim", "nano", "emacs", "ed", "ex",
+    "less", "more", "man", "view", "find", "xargs",
+    "python", "python3", "perl", "ruby", "node", "php", "lua",
+    "env", "script", "screen", "tmux", "su", "sudoedit",
+}
 
 
 def _md_escape(value) -> str:
@@ -54,7 +64,9 @@ def _target(config: dict) -> str:
 
 
 def _ssh_key_path(config: dict) -> str:
-    key_path = str(_service_config(config).get("ssh_key_path", "~/.ssh/id_ed25519"))
+    key_path = str(_service_config(config).get("ssh_key_path", "")).strip()
+    if not key_path:
+        raise RuntimeError("sudo service not configured: services.sudo.ssh_key_path is required")
     return os.path.expanduser(key_path)
 
 
@@ -69,6 +81,91 @@ def _ssh_port(config: dict) -> str:
     return str(n)
 
 
+def _strict_host_key_checking(config: dict) -> str:
+    value = str(_service_config(config).get("strict_host_key_checking", "yes")).strip().lower()
+    allowed = {"yes", "accept-new", "no"}
+    if value not in allowed:
+        raise RuntimeError(
+            "sudo service misconfigured: services.sudo.strict_host_key_checking "
+            f"must be one of {', '.join(sorted(allowed))}"
+        )
+    return value
+
+
+def _parse_command(command: str) -> list[str]:
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError as e:
+        raise ValueError(f"Invalid shell-style command syntax: {e}") from e
+    if not argv:
+        raise ValueError("'command' is required for 'run'")
+    return argv
+
+
+def _sudo_target_index(argv: list[str]) -> int:
+    """Return index of the command sudo will execute after sudo options."""
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            return i + 1
+        if not arg.startswith("-") or arg == "-":
+            return i
+        if arg in SUDO_OPTIONS_WITH_VALUE:
+            i += 2
+            continue
+        if any(arg.startswith(f"{opt}=") for opt in SUDO_OPTIONS_WITH_VALUE):
+            i += 1
+            continue
+        # Sudo also accepts combined short options. If one of the known options
+        # that takes a value is combined with the value (e.g. -uroot), it does
+        # not consume the next argument. Unknown/flag options are skipped.
+        i += 1
+    return len(argv)
+
+
+def _basename(path: str) -> str:
+    return PurePosixPath(path).name
+
+
+def _list_from_config(value, default: set[str] | None = None) -> set[str]:
+    if value is None:
+        return set(default or set())
+    if isinstance(value, str):
+        return {v.strip() for v in value.split(",") if v.strip()}
+    if isinstance(value, (list, tuple, set)):
+        return {str(v).strip() for v in value if str(v).strip()}
+    return set(default or set())
+
+
+def _validate_argv(argv: list[str], config: dict | None = None) -> None:
+    if argv[0] not in SUDO_BINARIES:
+        raise ValueError("'command' must start with sudo")
+
+    target_i = _sudo_target_index(argv)
+    if target_i >= len(argv):
+        raise ValueError("'command' must include a command for sudo to run")
+
+    target_cmd = _basename(argv[target_i])
+    svc = _service_config(config or {})
+    allowed = _list_from_config(svc.get("allowed_commands"), default=None)
+    denied = _list_from_config(svc.get("denied_commands"), default=DEFAULT_DENIED_COMMANDS)
+
+    if allowed and target_cmd not in allowed:
+        raise ValueError(f"sudo command '{target_cmd}' is not in services.sudo.allowed_commands")
+    if target_cmd in denied:
+        raise ValueError(f"sudo command '{target_cmd}' is denied by services.sudo.denied_commands")
+
+
+def _remote_command(command: str, config: dict | None = None) -> str:
+    argv = _parse_command(command)
+    _validate_argv(argv, config)
+    # SSH asks the remote account's shell to interpret the command string.
+    # Re-joining parsed argv with shell quoting preserves argv semantics while
+    # preventing metacharacters like ';', '&&', '|', '$()' from becoming syntax.
+    return shlex.join(argv)
+
+
 def _ssh_command(config: dict, remote_command: str) -> list[str]:
     return [
         "ssh",
@@ -77,7 +174,7 @@ def _ssh_command(config: dict, remote_command: str) -> list[str]:
         "-o", "BatchMode=yes",
         "-o", "PasswordAuthentication=no",
         "-o", "IdentitiesOnly=yes",
-        "-o", "StrictHostKeyChecking=accept-new",
+        "-o", f"StrictHostKeyChecking={_strict_host_key_checking(config)}",
         "-o", "ConnectTimeout=10",
         _target(config),
         remote_command,
@@ -106,15 +203,12 @@ class SudoService(BaseService):
             raise ValueError("'command' is required for 'run'")
         if "\x00" in command:
             raise ValueError("'command' must not contain NUL bytes")
+        if "```" in command:
+            raise ValueError("'command' must not contain triple backticks")
         if len(command) > 4000:
             raise ValueError("'command' is too long (max 4000 characters)")
 
-        # This service is intentionally scoped to sudo operations only. The
-        # gateway still asks for approval, but enforcing the prefix prevents it
-        # from becoming a generic remote shell by accident.
-        first = shlex.split(command, posix=True)[0] if command else ""
-        if first not in {"sudo", "/usr/bin/sudo", "/bin/sudo"}:
-            raise ValueError("'command' must start with sudo")
+        _validate_argv(_parse_command(command))
 
     @classmethod
     def execute(cls, action: str, data: dict, config: dict) -> dict:
@@ -122,8 +216,9 @@ class SudoService(BaseService):
         timeout = _timeout(config)
 
         try:
-            ssh_cmd = _ssh_command(config, command)
-        except RuntimeError as e:
+            safe_remote_command = _remote_command(command, config)
+            ssh_cmd = _ssh_command(config, safe_remote_command)
+        except (RuntimeError, ValueError) as e:
             return {"success": False, "output": str(e), "exit_code": -1}
 
         target = ssh_cmd[-2]
@@ -150,6 +245,7 @@ class SudoService(BaseService):
                 "stderr": stderr,
                 "exit_code": -1,
                 "command": command,
+                "remote_command": safe_remote_command,
                 "target": target,
             }
 
@@ -163,6 +259,7 @@ class SudoService(BaseService):
             "stderr": stderr,
             "exit_code": result.returncode,
             "command": command,
+            "remote_command": safe_remote_command,
             "target": target,
         }
 
@@ -176,9 +273,9 @@ class SudoService(BaseService):
             "📋 *Action:* `run approved sudo command`",
             "🖥 *Target:* configured gateway SSH target",
             "",
-            "⚠️ *Command to run exactly:*",
+            "⚠️ *Command requested:*",
             "```",
-            _md_escape(command),
+            command,
             "```",
         ]
         if data.get("details"):

@@ -440,6 +440,17 @@ class SudoClientTests(unittest.TestCase):
         self.assertEqual(captured["details"], "Install htop")
         self.assertTrue(captured["async_request"])
 
+    def test_sudo_run_centralizes_default_details(self):
+        captured = {}
+
+        class FakeClient(AuthProxyClient):
+            def _gate(self, service, action, params, details="", async_request=False):
+                captured["details"] = details
+                return {"success": True, "output": "queued"}
+
+        FakeClient().sudo_run("sudo apt install -y htop")
+        self.assertEqual(captured["details"], "Run sudo command: sudo apt install -y htop")
+
 
 class SudoServiceTests(unittest.TestCase):
     def test_validate_accepts_only_sudo_commands(self):
@@ -451,6 +462,18 @@ class SudoServiceTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "command.*required"):
             sudo_service.SudoService.validate("run", {"command": ""})
+
+        with self.assertRaisesRegex(ValueError, "denied"):
+            sudo_service.SudoService.validate("run", {"command": "sudo vi /etc/passwd"})
+
+        with self.assertRaisesRegex(ValueError, "must not contain triple backticks"):
+            sudo_service.SudoService.validate("run", {"command": "sudo echo ```"})
+
+    def test_remote_command_quotes_shell_metacharacters(self):
+        safe = sudo_service._remote_command("sudo ls; touch /tmp/pwned", {
+            "services": {"sudo": {"ssh_key_path": "/tmp/key", "host": "agent"}}
+        })
+        self.assertEqual(safe, "sudo 'ls;' touch /tmp/pwned")
 
     def test_execute_uses_ssh_argv_without_shell_and_preserves_command(self):
         completed = subprocess.CompletedProcess(
@@ -476,11 +499,31 @@ class SudoServiceTests(unittest.TestCase):
         self.assertEqual(args[0][0], "ssh")
         self.assertNotIn("shell", kwargs)
         self.assertIn("BatchMode=yes", args[0])
+        self.assertIn("StrictHostKeyChecking=yes", args[0])
         self.assertEqual(args[0][-2:], ["openclaw@agent.internal", "sudo apt install -y htop"])
         self.assertEqual(kwargs["timeout"], 45)
 
-    def test_execute_requires_configured_host(self):
+    def test_execute_quotes_remote_shell_metacharacters(self):
+        completed = subprocess.CompletedProcess(args=["ssh"], returncode=0, stdout="", stderr="")
+        config = {"services": {"sudo": {
+            "host": "agent.internal",
+            "ssh_key_path": "~/.ssh/sudo_key",
+        }}}
+
+        with mock.patch.object(sudo_service.subprocess, "run", return_value=completed) as run:
+            result = sudo_service.SudoService.execute("run", {"command": "sudo ls; touch /tmp/pwned"}, config)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["remote_command"], "sudo 'ls;' touch /tmp/pwned")
+        args, _ = run.call_args
+        self.assertEqual(args[0][-1], "sudo 'ls;' touch /tmp/pwned")
+
+    def test_execute_requires_configured_host_and_key(self):
         result = sudo_service.SudoService.execute("run", {"command": "sudo true"}, {"services": {"sudo": {}}})
+        self.assertFalse(result["success"])
+        self.assertIn("services.sudo.ssh_key_path", result["output"])
+
+        result = sudo_service.SudoService.execute("run", {"command": "sudo true"}, {"services": {"sudo": {"ssh_key_path": "/tmp/key"}}})
         self.assertFalse(result["success"])
         self.assertIn("services.sudo.host", result["output"])
 

@@ -61,8 +61,14 @@ services:
     host: "agent-vm.example.internal"
     user: "openclaw"
     port: 22
-    # Private key on the gateway; public key must be authorized on the target.
+    # Dedicated private key on the gateway; required. Do not reuse personal keys.
+    # Public key must be authorized on the target.
     ssh_key_path: "~/.ssh/id_ed25519_agent_vm"
+    # Prefer "yes" with a pre-pinned known_hosts entry. "accept-new" is available
+    # for lower-touch setup but trusts the first connection.
+    strict_host_key_checking: "yes"
+    # Basenames denied even after approval because they commonly spawn shells.
+    denied_commands: ["sh", "bash", "zsh", "vi", "vim", "nano", "find", "xargs", "env"]
     # Timeout for the remote sudo command (seconds)
     timeout: 300
 
