@@ -43,8 +43,11 @@ privileged operation.
 | `github` | `list-repos` | List repositories visible to the GitHub token |
 | `github` | `create-repo` | Create a GitHub repository                  |
 | `github` | `create-pr`   | Create a GitHub pull request                |
+| `sudo` | `run` | Run an approved sudo command over SSH on the configured target |
 
 Only SSH git URLs are allowed (`git@github.com:user/repo.git` or `ssh://`).
+The `sudo` service only accepts commands that start with `sudo`; SSH target, user,
+port, and key are configured on the gateway and cannot be overridden by requests.
 
 ## Adding a New Service
 
@@ -234,6 +237,14 @@ services:
     enabled: true
     ssh_key_path: "~/.ssh/id_ed25519"    # the user's GitHub SSH key
     timeout: 120
+
+  sudo:
+    enabled: true
+    host: "agent-vm.example.internal"     # target machine for sudo commands
+    user: "openclaw"
+    port: 22
+    ssh_key_path: "~/.ssh/id_ed25519_agent_vm"
+    timeout: 300
 ```
 
 ### Environment Variables (override config)
@@ -295,6 +306,14 @@ result = proxy.gate("git", "push-bundle", {
     "bundle_b64": "...",
 }, details="Description")
 
+# ── Sudo over SSH ──
+sudo_result = proxy.sudo_run(
+    command="sudo apt install -y htop",
+    details="Install htop on the agent VM",
+    async_request=True,
+)
+status = proxy.request_status(sudo_result["request_id"])
+
 # ── GitHub API ──
 repos = proxy.github_list_repos(filter="my-project")
 pr = proxy.github_create_pr(
@@ -332,6 +351,12 @@ python auth-proxy-client.py push-bundle \
 
 python auth-proxy-client.py git-clear-cache \
     --details "Remove cached gateway repos"
+
+# Sudo over SSH
+python auth-proxy-client.py sudo-run \
+    --command "sudo apt install -y htop" \
+    --details "Install htop on the agent VM" \
+    --async
 
 # GitHub API
 python auth-proxy-client.py github-list-repos --filter my-project
@@ -482,6 +507,7 @@ auth-proxy/
     ├── __init__.py                # Service registry + BaseService
     ├── git.py                     # Git bundle transport service
     ├── github.py                  # GitHub REST API service
+    ├── sudo.py                    # Approved sudo-over-SSH service
     └── calendar.py                # (future) Google Calendar service
 ```
 

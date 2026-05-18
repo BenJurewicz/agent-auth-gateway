@@ -22,6 +22,9 @@ Usage as CLI:
     python auth-proxy-client.py git-clear-cache \\
         --details "Remove cached gateway repos"
 
+    python auth-proxy-client.py sudo-run --command "sudo apt install -y htop" \\
+        --details "Install htop on the agent VM"
+
     python auth-proxy-client.py health
 
     # GitHub — list repos (no approval needed)
@@ -52,6 +55,9 @@ Usage as library:
                           branch="main", details="My update")
 
     proxy.git_clear_cache(details="Remove cached gateway repos")
+
+    # Sudo over SSH (requires approval)
+    proxy.sudo_run(command="sudo apt install -y htop", details="Install htop")
 
     # GitHub API (no git involved)
     result = proxy.github_list_repos(filter="agent-auth")
@@ -461,6 +467,28 @@ class AuthProxyClient:
         """Clear all cached bare repos stored on the gateway."""
         return self._gate("git", "clear-cache", {}, details, async_request=async_request)
 
+    # ── Sudo service ───────────────────────────────────────────────────
+
+    def sudo_run(
+        self,
+        command: str,
+        details: str = "",
+        async_request: bool = False,
+    ) -> dict:
+        """Run an approved sudo command on the configured SSH target.
+
+        Args:
+            command: Exact command string to run remotely. Must start with sudo.
+            details: Human-readable context for approval prompt.
+            async_request: Queue request and return immediately.
+
+        Returns:
+            Dict with keys: success, output, stdout, stderr, exit_code, command, target.
+        """
+        if not details:
+            details = f"Run sudo command: {command}"
+        return self._gate("sudo", "run", {"command": command}, details, async_request=async_request)
+
     # ── GitHub service ─────────────────────────────────────────────────
 
     def github_list_repos(
@@ -655,6 +683,17 @@ def cli() -> None:
         help="Override request timeout in seconds")
     p_git_clear.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
 
+    # ── sudo run ───────────────────────────────────────────────────────
+    p_sudo = sub.add_parser("sudo-run",
+        help="Run an approved sudo command over SSH on the configured target")
+    p_sudo.add_argument("--command", dest="sudo_command", required=True,
+        help="Exact command to run remotely; must start with sudo")
+    p_sudo.add_argument("--details", "-d", default="",
+        help="Human-readable context for approval prompt")
+    p_sudo.add_argument("--timeout", type=int, default=0,
+        help="Override request timeout in seconds")
+    p_sudo.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
+
     # ── github list-repos ──────────────────────────────────────────────
     p_gh_list = sub.add_parser("github-list-repos",
         help="List GitHub repositories (no approval needed)")
@@ -789,6 +828,17 @@ def cli() -> None:
         client.timeout = timeout or 600
         result = client.git_clear_cache(
             details=args.details or "Clear cached bare repos from the auth gateway",
+            async_request=args.async_request,
+        )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── sudo-run ───────────────────────────────────────────────────────
+    elif args.command == "sudo-run":
+        client.timeout = timeout or 600
+        result = client.sudo_run(
+            command=args.sudo_command,
+            details=args.details or f"Run sudo command: {args.sudo_command}",
             async_request=args.async_request,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))

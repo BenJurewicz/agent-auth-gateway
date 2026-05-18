@@ -13,6 +13,7 @@ from unittest import mock
 from pathlib import Path
 
 import services.git as git_service
+import services.sudo as sudo_service
 
 
 CLIENT_PATH = Path(__file__).with_name("auth-proxy-client.py")
@@ -409,6 +410,88 @@ class RequestQueueTests(unittest.TestCase):
 
         self.assertEqual(public["data"]["title"], "PR")
         self.assertEqual(public["data"]["body"], "<redacted 14 chars>")
+
+
+class SudoClientTests(unittest.TestCase):
+    def test_sudo_run_sends_exact_command(self):
+        captured = {}
+
+        class FakeClient(AuthProxyClient):
+            def _gate(self, service, action, params, details="", async_request=False):
+                captured.update({
+                    "service": service,
+                    "action": action,
+                    "params": params,
+                    "details": details,
+                    "async_request": async_request,
+                })
+                return {"success": True, "output": "queued"}
+
+        result = FakeClient().sudo_run(
+            "sudo apt install -y htop",
+            details="Install htop",
+            async_request=True,
+        )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(captured["service"], "sudo")
+        self.assertEqual(captured["action"], "run")
+        self.assertEqual(captured["params"], {"command": "sudo apt install -y htop"})
+        self.assertEqual(captured["details"], "Install htop")
+        self.assertTrue(captured["async_request"])
+
+
+class SudoServiceTests(unittest.TestCase):
+    def test_validate_accepts_only_sudo_commands(self):
+        sudo_service.SudoService.validate("run", {"command": "sudo apt install -y htop"})
+        sudo_service.SudoService.validate("run", {"command": "/usr/bin/sudo systemctl restart ssh"})
+
+        with self.assertRaisesRegex(ValueError, "must start with sudo"):
+            sudo_service.SudoService.validate("run", {"command": "apt install -y htop"})
+
+        with self.assertRaisesRegex(ValueError, "command.*required"):
+            sudo_service.SudoService.validate("run", {"command": ""})
+
+    def test_execute_uses_ssh_argv_without_shell_and_preserves_command(self):
+        completed = subprocess.CompletedProcess(
+            args=["ssh"], returncode=0, stdout="ok\n", stderr="",
+        )
+        config = {"services": {"sudo": {
+            "host": "agent.internal",
+            "user": "openclaw",
+            "port": 2222,
+            "ssh_key_path": "~/.ssh/sudo_key",
+            "timeout": 45,
+        }}}
+
+        with mock.patch.object(sudo_service.subprocess, "run", return_value=completed) as run:
+            result = sudo_service.SudoService.execute("run", {"command": "sudo apt install -y htop"}, config)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["output"], "ok")
+        self.assertEqual(result["command"], "sudo apt install -y htop")
+        self.assertEqual(result["target"], "openclaw@agent.internal")
+
+        args, kwargs = run.call_args
+        self.assertEqual(args[0][0], "ssh")
+        self.assertNotIn("shell", kwargs)
+        self.assertIn("BatchMode=yes", args[0])
+        self.assertEqual(args[0][-2:], ["openclaw@agent.internal", "sudo apt install -y htop"])
+        self.assertEqual(kwargs["timeout"], 45)
+
+    def test_execute_requires_configured_host(self):
+        result = sudo_service.SudoService.execute("run", {"command": "sudo true"}, {"services": {"sudo": {}}})
+        self.assertFalse(result["success"])
+        self.assertIn("services.sudo.host", result["output"])
+
+    def test_sudo_approval_text_includes_exact_command(self):
+        text = sudo_service.SudoService.approval_text("run", {
+            "command": "sudo apt install -y htop",
+            "details": "Needs *approval*",
+        }, "abcdefghijklmnopqrstuvwxyz")
+
+        self.assertIn("sudo apt install -y htop", text)
+        self.assertIn(r"Needs \*approval\*", text)
 
 
 class GitServiceTests(unittest.TestCase):
