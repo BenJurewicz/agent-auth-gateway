@@ -29,7 +29,10 @@ import json
 import logging
 import os
 import secrets
+import shutil
+import sqlite3
 import sys
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -64,7 +67,7 @@ logging.basicConfig(
 )
 log = logging.getLogger("auth-proxy")
 
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 # ── Config Loading ───────────────────────────────────────────────────────────
 CONFIG_PATH = Path(__file__).parent.resolve() / "config.yaml"
@@ -73,7 +76,7 @@ DEFAULT_CONFIG = {
     "server": {"host": "0.0.0.0", "port": 8443},
     "api": {"auth_token": ""},
     "telegram": {"bot_token": "", "allowed_user_ids": []},
-    "approval": {"mode": "telegram", "timeout": 300},
+    "approval": {"mode": "telegram", "timeout": 300, "request_ttl": 14400, "db_path": ""},
     "services": {},
 }
 
@@ -109,87 +112,264 @@ def load_config() -> dict:
 
 config = load_config()
 
-# ── Request Store ────────────────────────────────────────────────────────────
+# ── Durable Request Store ───────────────────────────────────────────────────
 
-class PendingRequest:
-    """An operation awaiting user approval."""
+TERMINAL_STATUSES = {"succeeded", "failed", "denied", "expired", "cancelled"}
 
-    def __init__(self, service: str, action: str, data: dict) -> None:
-        self.id = secrets.token_urlsafe(16)
-        self.service = service
-        self.action = action
-        self.data = data
-        self.created_at = time.time()
-        self.event = asyncio.Event()
-        self.result: Optional[dict] = None
-        self.approved: Optional[bool] = None
 
-    @property
-    def ttl(self) -> int:
-        return config.get("approval", {}).get("timeout", 300)
+def _now() -> float:
+    return time.time()
 
-    @property
-    def expired(self) -> bool:
-        return time.time() - self.created_at > self.ttl
 
-    def approve(self) -> None:
-        self.approved = True
-        self.event.set()
+def _approval_timeout() -> int:
+    return int(config.get("approval", {}).get("timeout", 300))
 
-    def deny(self) -> None:
-        self.approved = False
-        self.result = {"success": False, "output": "Request denied by user", "exit_code": -1, "approved": False}
-        self.event.set()
 
-    def fail_timeout(self) -> None:
-        self.approved = False
-        self.result = {"success": False, "output": "Approval timed out", "exit_code": -1, "approved": False}
-        self.event.set()
+def _request_ttl() -> int:
+    return int(config.get("approval", {}).get("request_ttl", 14400))
+
+
+def _db_path() -> Path:
+    configured = config.get("approval", {}).get("db_path", "")
+    if configured:
+        return Path(os.path.expanduser(configured))
+    return Path(__file__).parent.resolve() / "auth-proxy-requests.sqlite3"
+
+
+def _artifact_dir() -> Path:
+    path = Path(__file__).parent.resolve() / "request-artifacts"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 class RequestStore:
-    """Async-safe store for pending approval requests."""
+    """SQLite-backed approval/execution queue.
 
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._requests: dict[str, PendingRequest] = {}
+    HTTP requests are short-lived. Approval requests are durable and can be
+    approved hours later, then executed by the background worker.
+    """
 
-    async def add(self, req: PendingRequest) -> None:
-        async with self._lock:
-            self._requests[req.id] = req
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
+        self._events: dict[str, asyncio.Event] = {}
+        self._init_db()
 
-    async def get(self, rid: str) -> Optional[PendingRequest]:
-        async with self._lock:
-            return self._requests.get(rid)
+    def _connect(self) -> sqlite3.Connection:
+        con = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        con.row_factory = sqlite3.Row
+        return con
 
-    async def remove(self, rid: str) -> None:
-        async with self._lock:
-            self._requests.pop(rid, None)
+    def _init_db(self) -> None:
+        with self._lock, self._connect() as con:
+            con.execute("PRAGMA journal_mode=WAL")
+            con.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id TEXT PRIMARY KEY,
+                    service TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    data_json TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    expires_at REAL NOT NULL,
+                    result_json TEXT,
+                    artifact_path TEXT,
+                    approved_by TEXT,
+                    approved_at REAL
+                )
+            """)
+            con.execute("CREATE INDEX IF NOT EXISTS idx_requests_status ON requests(status)")
+            con.execute("CREATE INDEX IF NOT EXISTS idx_requests_expires ON requests(expires_at)")
 
-    async def reap(self) -> int:
-        async with self._lock:
-            now = time.time()
-            dead = [r for r in self._requests.values() if r.expired and not r.event.is_set()]
-            for req in dead:
-                req.fail_timeout()
-                del self._requests[req.id]
-        return len(dead)
+    def _row_to_dict(self, row: sqlite3.Row | None) -> Optional[dict]:
+        if row is None:
+            return None
+        d = dict(row)
+        d["data"] = json.loads(d.pop("data_json") or "{}")
+        result_raw = d.pop("result_json", None)
+        d["result"] = json.loads(result_raw) if result_raw else None
+        d["expired"] = d["status"] not in TERMINAL_STATUSES and _now() > d["expires_at"]
+        return d
+
+    def create(self, service: str, action: str, data: dict, *, status: str = "pending") -> dict:
+        req_id = secrets.token_urlsafe(16)
+        now = _now()
+        expires_at = now + _request_ttl()
+        with self._lock, self._connect() as con:
+            con.execute(
+                """INSERT INTO requests
+                   (id, service, action, data_json, status, created_at, updated_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (req_id, service, action, json.dumps(data), status, now, now, expires_at),
+            )
+        return self.get(req_id) or {"id": req_id, "service": service, "action": action, "status": status}
+
+    def get(self, req_id: str) -> Optional[dict]:
+        with self._lock, self._connect() as con:
+            row = con.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
+        return self._row_to_dict(row)
+
+    def list(self, status: str = "", limit: int = 50) -> list[dict]:
+        limit = max(1, min(int(limit), 200))
+        with self._lock, self._connect() as con:
+            if status:
+                rows = con.execute(
+                    "SELECT * FROM requests WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    "SELECT * FROM requests ORDER BY created_at DESC LIMIT ?", (limit,),
+                ).fetchall()
+        return [self._row_to_dict(r) for r in rows]
+
+    def count_pending(self) -> int:
+        with self._lock, self._connect() as con:
+            row = con.execute(
+                "SELECT COUNT(*) AS n FROM requests WHERE status IN ('pending', 'approved', 'running')"
+            ).fetchone()
+        return int(row["n"])
+
+    def _notify(self, req_id: str) -> None:
+        ev = self._events.get(req_id)
+        if ev and not ev.is_set():
+            ev.set()
+
+    def event_for(self, req_id: str) -> asyncio.Event:
+        ev = self._events.get(req_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._events[req_id] = ev
+        return ev
+
+    def approve(self, req_id: str, approved_by: str = "") -> bool:
+        now = _now()
+        with self._lock, self._connect() as con:
+            cur = con.execute(
+                """UPDATE requests
+                   SET status = 'approved', approved_by = ?, approved_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'pending' AND expires_at > ?""",
+                (approved_by, now, now, req_id, now),
+            )
+            ok = cur.rowcount == 1
+        if ok:
+            self._notify(req_id)
+        return ok
+
+    def deny(self, req_id: str, approved_by: str = "") -> bool:
+        result = {"success": False, "output": "Request denied by user", "exit_code": -1, "approved": False}
+        return self.finish(req_id, "denied", result, approved_by=approved_by)
+
+    def cancel(self, req_id: str, reason: str = "Request cancelled") -> bool:
+        result = {"success": False, "output": reason, "exit_code": -1, "approved": False}
+        now = _now()
+        with self._lock, self._connect() as con:
+            cur = con.execute(
+                """UPDATE requests SET status = 'cancelled', result_json = ?, updated_at = ?
+                   WHERE id = ? AND status IN ('pending', 'approved', 'running')""",
+                (json.dumps(result), now, req_id),
+            )
+            ok = cur.rowcount == 1
+        if ok:
+            self._notify(req_id)
+        return ok
+
+    def expire_stale(self) -> int:
+        now = _now()
+        result = {"success": False, "output": "Approval expired", "exit_code": -1, "approved": False}
+        with self._lock, self._connect() as con:
+            rows = con.execute(
+                "SELECT id FROM requests WHERE status IN ('pending', 'approved') AND expires_at <= ?",
+                (now,),
+            ).fetchall()
+            con.execute(
+                """UPDATE requests SET status = 'expired', result_json = ?, updated_at = ?
+                   WHERE status IN ('pending', 'approved') AND expires_at <= ?""",
+                (json.dumps(result), now, now),
+            )
+        for r in rows:
+            self._notify(r["id"])
+        return len(rows)
+
+    def claim_next_approved(self) -> Optional[dict]:
+        now = _now()
+        with self._lock, self._connect() as con:
+            row = con.execute(
+                """SELECT * FROM requests
+                   WHERE status = 'approved' AND expires_at > ?
+                   ORDER BY approved_at ASC, created_at ASC LIMIT 1""",
+                (now,),
+            ).fetchone()
+            if not row:
+                return None
+            cur = con.execute(
+                "UPDATE requests SET status = 'running', updated_at = ? WHERE id = ? AND status = 'approved'",
+                (now, row["id"]),
+            )
+            if cur.rowcount != 1:
+                return None
+        self._notify(row["id"])
+        return self.get(row["id"])
+
+    def finish(self, req_id: str, status: str, result: dict, *, artifact_path: str = "", approved_by: str = "") -> bool:
+        now = _now()
+        with self._lock, self._connect() as con:
+            cur = con.execute(
+                """UPDATE requests
+                   SET status = ?, result_json = ?, artifact_path = COALESCE(NULLIF(?, ''), artifact_path),
+                       approved_by = COALESCE(NULLIF(?, ''), approved_by), updated_at = ?
+                   WHERE id = ? AND status NOT IN ('succeeded', 'failed', 'denied', 'expired', 'cancelled')""",
+                (status, json.dumps(result), artifact_path, approved_by, now, req_id),
+            )
+            ok = cur.rowcount == 1
+        if ok:
+            self._notify(req_id)
+        return ok
+
+    async def wait_terminal(self, req_id: str, timeout: int) -> dict:
+        deadline = _now() + timeout
+        while True:
+            req = self.get(req_id)
+            if not req:
+                return {"status": "missing", "result": {"success": False, "output": "Request not found", "exit_code": -1}}
+            if req["status"] in TERMINAL_STATUSES:
+                return req
+            remaining = deadline - _now()
+            if remaining <= 0:
+                return req
+            ev = self.event_for(req_id)
+            ev.clear()
+            try:
+                await asyncio.wait_for(ev.wait(), timeout=min(remaining, 5))
+            except asyncio.TimeoutError:
+                pass
+
+
+request_store = RequestStore(_db_path())
+
+
+class ApprovalRequestView:
+    """Small adapter used only for service approval_text rendering."""
+    def __init__(self, row: dict) -> None:
+        self.id = row["id"]
+        self.service = row["service"]
+        self.action = row["action"]
+        self.data = row["data"]
+        self.created_at = row["created_at"]
 
     @property
-    async def count(self) -> int:
-        async with self._lock:
-            return len(self._requests)
+    def ttl(self) -> int:
+        return max(0, int(self.created_at + _request_ttl() - _now()))
 
-
-request_store = RequestStore()
 
 # ── Telegram ─────────────────────────────────────────────────────────────────
 
-def _fmt_approval(req: PendingRequest) -> str:
+def _fmt_approval(req: ApprovalRequestView) -> str:
     svc = get_service(req.service)
     if svc:
         return svc.approval_text(req.action, req.data, req.id)
-    # Fallback for unknown services
     lines = [
         "🔐 *Auth Proxy — Operation*",
         f"`{req.id[:16]}…`",
@@ -201,18 +381,19 @@ def _fmt_approval(req: PendingRequest) -> str:
     return "\n".join(lines)
 
 
-async def send_approval(req: PendingRequest) -> None:
+async def send_approval(row: dict) -> None:
     tg = config.get("telegram", {})
     token = tg.get("bot_token", "")
     allowed = tg.get("allowed_user_ids", [])
 
     bot = Bot(token=token)
-    text = _fmt_approval(req)
+    view = ApprovalRequestView(row)
+    text = _fmt_approval(view)
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("✅ Approve", callback_data=f"ap:{req.id}"),
-            InlineKeyboardButton("❌ Deny", callback_data=f"de:{req.id}"),
+            InlineKeyboardButton("✅ Approve", callback_data=f"ap:{view.id}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"de:{view.id}"),
         ]
     ])
 
@@ -232,7 +413,7 @@ async def send_approval(req: PendingRequest) -> None:
             "Could not deliver Telegram approval message to any user. "
             "Check 'allowed_user_ids' and 'bot_token' in config."
         )
-    log.info("Approval %s sent to %d user(s)", req.id[:16], sent)
+    log.info("Approval %s sent to %d user(s)", view.id[:16], sent)
 
 
 async def _safe_edit(query, text: str, **kwargs) -> None:
@@ -263,22 +444,28 @@ async def handle_tg_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await _safe_edit(query, "⛔ You are not authorized to approve requests.")
         return
 
-    req = await request_store.get(req_id)
-    if not req or req.event.is_set():
+    req = request_store.get(req_id)
+    if not req or req["status"] != "pending" or req.get("expired"):
         await _safe_edit(query, "⌛ This request has already been processed or expired.")
         return
 
-    name = f"@{user.username}" if user and user.username else (user.first_name or "Unknown")
+    name = f"@{user.username}" if user and user.username else ((user.first_name if user else None) or "Unknown")
 
     if action == "ap":
-        req.approve()
+        ok = request_store.approve(req_id, approved_by=str(uid or ""))
+        if not ok:
+            await _safe_edit(query, "⌛ This request has already been processed or expired.")
+            return
         await _safe_edit(query,
-            text=query.message.text + f"\n\n✅ *Approved by* {name}",
+            text=query.message.text + f"\n\n✅ *Approved by* {name}\n⏳ Queued for execution.",
             parse_mode=TGParseMode.MARKDOWN, reply_markup=None,
         )
         log.info("Request %s APPROVED by %s", req_id[:16], uid)
     else:
-        req.deny()
+        ok = request_store.deny(req_id, approved_by=str(uid or ""))
+        if not ok:
+            await _safe_edit(query, "⌛ This request has already been processed or expired.")
+            return
         await _safe_edit(query,
             text=query.message.text + f"\n\n❌ *Denied by* {name}",
             parse_mode=TGParseMode.MARKDOWN, reply_markup=None,
@@ -312,11 +499,11 @@ async def telegram_bot_main() -> None:
 
 # ── Console Approval ─────────────────────────────────────────────────────────
 
-async def console_approval(req: PendingRequest) -> bool:
+async def console_approval(row: dict) -> bool:
     print("\n" + "=" * 60, flush=True)
     print("🔐 AUTH PROXY — OPERATION REQUIRES APPROVAL".center(60))
     print("=" * 60, flush=True)
-    text = _fmt_approval(req).replace("*", "").replace("`", "")
+    text = _fmt_approval(ApprovalRequestView(row)).replace("*", "").replace("`", "")
     print(text)
     print("-" * 60, flush=True)
     print("Approve? [y/N]: ", end="", flush=True)
@@ -330,19 +517,17 @@ async def console_approval(req: PendingRequest) -> bool:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("Auth Proxy starting — services: %s", ", ".join(list_services()))
     reap_task = asyncio.create_task(_reaper_loop())
+    worker_task = asyncio.create_task(_worker_loop())
     tg_task = asyncio.create_task(telegram_bot_main())
     yield
     log.info("Auth Proxy shutting down")
-    tg_task.cancel()
-    reap_task.cancel()
-    try:
-        await tg_task
-    except (asyncio.CancelledError, Exception):
-        pass
-    try:
-        await reap_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    for task in (tg_task, worker_task, reap_task):
+        task.cancel()
+    for task in (tg_task, worker_task, reap_task):
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 app = FastAPI(
@@ -359,6 +544,7 @@ app = FastAPI(
 class GateRequest(BaseModel):
     params: dict = {}       # Service-specific parameters
     details: str = ""       # Human-readable context for approval prompt
+    async_request: bool = False  # Return after enqueue instead of waiting for execution
 
 
 class GateResponse(BaseModel):
@@ -369,6 +555,28 @@ class GateResponse(BaseModel):
     request_id: str = ""
     service: str = ""
     action: str = ""
+    status: str = ""
+
+
+def _public_request(row: dict) -> dict:
+    data = dict(row.get("data") or {})
+    if "bundle_b64" in data:
+        data["bundle_b64"] = f"<redacted {len(data['bundle_b64'])} chars>"
+    return {
+        "id": row["id"],
+        "service": row["service"],
+        "action": row["action"],
+        "status": row["status"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "expires_at": row["expires_at"],
+        "approved_by": row.get("approved_by"),
+        "approved_at": row.get("approved_at"),
+        "expired": row.get("expired", False),
+        "data": data,
+        "result": row.get("result"),
+        "has_artifact": bool(row.get("artifact_path")),
+    }
 
 
 def _gate_response_payload(
@@ -378,6 +586,7 @@ def _gate_response_payload(
     request_id: str,
     service: str,
     action: str,
+    status: str = "",
 ) -> dict:
     payload = dict(result)
     output = payload.get("output", "")
@@ -392,8 +601,23 @@ def _gate_response_payload(
         "request_id": request_id,
         "service": service,
         "action": action,
+        "status": status or payload.get("status", ""),
     })
     return payload
+
+
+def _queued_payload(row: dict) -> dict:
+    return {
+        "success": True,
+        "output": f"Request queued: {row['id']}",
+        "exit_code": 0,
+        "approved": False,
+        "request_id": row["id"],
+        "service": row["service"],
+        "action": row["action"],
+        "status": row["status"],
+        "expires_at": row["expires_at"],
+    }
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -409,39 +633,32 @@ async def _check_auth(authorization: str | None = Header(None)) -> bool:
     return secrets.compare_digest(authorization, expected)
 
 
+async def _require_auth(authorization: str | None = Header(None)) -> None:
+    if not await _check_auth(authorization):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # ── Shared Gate Logic ────────────────────────────────────────────────────────
 
-async def _run_gate_flow(
-    service: str,
-    action: str,
-    body: GateRequest,
-    authorization: str | None,
-) -> tuple:
-    """
-    Validate auth, service, params, run approval, and execute.
-
-    Returns (svc_class, pending_req, exec_result, None) on success, or
-    (None, None, None, error_response) on failure (error_response is
-    either an HTTPException or a dict for JSON/binary endpoints).
-    """
-    # Auth
+async def _submit_request(service: str, action: str, body: GateRequest, authorization: str | None) -> tuple:
     if not await _check_auth(authorization):
-        return (None, None, None, HTTPException(status_code=401, detail="Unauthorized"))
+        return (None, None, HTTPException(status_code=401, detail="Unauthorized"))
 
-    # Service lookup
     svc = get_service(service)
     if not svc:
-        return (None, None, None, HTTPException(
+        return (None, None, HTTPException(
             status_code=404, detail=f"Unknown service: '{service}'. Available: {', '.join(list_services())}"
         ))
 
-    # Validation
     try:
         svc.validate(action, body.params)
     except ValueError as e:
-        return (None, None, None, HTTPException(status_code=400, detail=str(e)))
+        return (None, None, HTTPException(status_code=400, detail=str(e)))
 
-    # Approval mode
+    req_data = {**body.params, "details": body.details}
+    needs_approval = svc.requires_approval(action)
+    row = request_store.create(service, action, req_data, status="pending" if needs_approval else "approved")
+
     approval_mode = config.get("approval", {}).get("mode", "telegram")
     tg_configured = bool(
         config.get("telegram", {}).get("bot_token", "")
@@ -449,75 +666,54 @@ async def _run_gate_flow(
     )
     use_telegram = approval_mode == "telegram" and tg_configured
 
-    # Create pending request
-    req_data = {**body.params, "details": body.details}
-    req = PendingRequest(service, action, req_data)
-    await request_store.add(req)
-
-    # Check if this action requires approval
-    needs_approval = svc.requires_approval(action)
-
-    # ── Send approval (or skip) ────────────────────────────────────────
     if not needs_approval:
-        log.info("Action %s/%s does not require approval — executing directly", service, action)
-        req.approve()
+        log.info("Action %s/%s does not require approval — queued directly", service, action)
     elif use_telegram:
         try:
-            await send_approval(req)
+            await send_approval(row)
         except Exception as e:
-            await request_store.remove(req.id)
-            err = HTTPException(status_code=502, detail=f"Failed to send Telegram approval: {e}")
-            return (None, None, None, err)
+            request_store.cancel(row["id"], reason=f"Failed to send Telegram approval: {e}")
+            return (None, None, HTTPException(status_code=502, detail=f"Failed to send Telegram approval: {e}"))
     elif approval_mode == "auto":
         log.info("Auto-approval — approving without user interaction")
-        req.approve()
+        request_store.approve(row["id"], approved_by="auto")
     elif approval_mode == "console":
-        approved = await console_approval(req)
+        approved = await console_approval(row)
         if approved:
-            req.approve()
+            request_store.approve(row["id"], approved_by="console")
         else:
-            req.deny()
+            request_store.deny(row["id"], approved_by="console")
     else:
-        await request_store.remove(req.id)
-        err = HTTPException(status_code=500, detail=f"Unknown approval mode: {approval_mode}")
+        request_store.cancel(row["id"], reason=f"Unknown approval mode: {approval_mode}")
+        return (None, None, HTTPException(status_code=500, detail=f"Unknown approval mode: {approval_mode}"))
+
+    return (svc, request_store.get(row["id"]), None)
+
+
+async def _run_gate_flow(service: str, action: str, body: GateRequest, authorization: str | None) -> tuple:
+    svc, row, err = await _submit_request(service, action, body, authorization)
+    if err is not None:
         return (None, None, None, err)
 
-    # ── Wait for result ─────────────────────────────────────────────────
-    ttl = req.ttl
-    try:
-        await asyncio.wait_for(req.event.wait(), timeout=ttl)
-    except asyncio.TimeoutError:
-        req.fail_timeout()
-        await request_store.remove(req.id)
-        timeout_result = {
-            "success": False, "output": "Approval timed out", "exit_code": -1,
-            "approved": False, "request_id": req.id, "service": service, "action": action,
-        }
-        return (None, None, None, timeout_result)
+    if body.async_request:
+        return (svc, row, _queued_payload(row), None)
 
-    if not req.approved:
-        result = req.result or {"success": False, "output": "Denied", "exit_code": -1}
-        await request_store.remove(req.id)
-        denied_result = {
-            "success": result["success"],
-            "output": result.get("output", ""),
-            "exit_code": result.get("exit_code", -1),
+    final = await request_store.wait_terminal(row["id"], _approval_timeout())
+    if final["status"] not in TERMINAL_STATUSES:
+        return (None, None, None, {
+            "success": False,
+            "output": "Request is still pending/running; use request-status to check later",
+            "exit_code": -1,
             "approved": False,
-            "request_id": req.id,
+            "request_id": row["id"],
             "service": service,
             "action": action,
-        }
-        return (None, None, None, denied_result)
+            "status": final["status"],
+        })
 
-    # ── Execute ─────────────────────────────────────────────────────────
-    try:
-        exec_result = svc.execute(action, req_data, config)
-    except Exception as e:
-        log.error("Service execution error: %s", e)
-        exec_result = {"success": False, "output": f"Execution error: {e}", "exit_code": -1}
-
-    await request_store.remove(req.id)
-    return (svc, req, exec_result, None)
+    result = final.get("result") or {"success": False, "output": final["status"], "exit_code": -1}
+    approved = final["status"] not in {"denied", "expired", "cancelled"}
+    return (svc, final, result, None)
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -529,35 +725,29 @@ async def handle_gate(
     body: GateRequest,
     authorization: str | None = Header(None),
 ) -> dict:
-    """Submit a service operation for approval and execution.
-
-    The request goes through:
-      1. Validation
-      2. Telegram approval (the user taps ✅ or ❌)
-      3. Execution on the proxy
-
-    Returns the execution result as JSON.
-    """
+    """Submit a service operation. Use ``async_request`` to enqueue only."""
     svc, req, exec_result, err = await _run_gate_flow(service, action, body, authorization)
 
     if err is not None:
         if isinstance(err, HTTPException):
             raise err
-        # err is a dict (timeout or denied result)
         return _gate_response_payload(
             err,
             approved=err.get("approved", False),
             request_id=err.get("request_id", ""),
             service=service,
             action=action,
+            status=err.get("status", ""),
         )
 
+    approved = req["status"] not in {"pending", "denied", "expired", "cancelled"}
     return _gate_response_payload(
         exec_result,
-        approved=True,
-        request_id=req.id,
+        approved=approved,
+        request_id=req["id"],
         service=service,
         action=action,
+        status=req["status"],
     )
 
 
@@ -570,33 +760,35 @@ async def handle_gate_pull(
 ) -> Response:
     """Binary-download variant of /gate/{service}/{action}.
 
-    Same auth, validation, and Telegram approval flow. After execution,
-    if the service returns a file path via ``_binary_file``, the file is
-    streamed as application/octet-stream. Otherwise a JSON GateResponse
-    is returned.
+    Async pull requests return JSON with a request id. Blocking pull requests
+    stream the artifact once the background worker has produced it.
     """
     svc, req, exec_result, err = await _run_gate_flow(service, action, body, authorization)
 
-    # Handle errors
     if err is not None:
         if isinstance(err, HTTPException):
             raise err
-        # err is a dict (timeout or denied result)
         return Response(
             content=json.dumps(err),
             media_type="application/json",
-            status_code=403 if err.get("approved") is False else 408,
+            status_code=202 if err.get("status") in {"pending", "approved", "running"} else 403,
         )
 
-    # Check for binary file in the result
+    if body.async_request:
+        return Response(content=json.dumps(exec_result), media_type="application/json", status_code=202)
+
     response_result = dict(exec_result)
-    binary_file = response_result.pop("_binary_file", None)
+    artifact_path = req.get("artifact_path")
+    binary_file = response_result.pop("_binary_file", None) or artifact_path
     if binary_file and exec_result.get("success"):
         try:
             with open(binary_file, "rb") as f:
                 content = f.read()
-            os.unlink(binary_file)
-            log.info("Streamed bundle %s (%d bytes) in /gate/pull response", binary_file, len(content))
+            try:
+                os.unlink(binary_file)
+            except OSError:
+                pass
+            log.info("Streamed artifact %s (%d bytes) in /gate/pull response", binary_file, len(content))
             return Response(
                 content=content,
                 media_type="application/octet-stream",
@@ -607,48 +799,143 @@ async def handle_gate_pull(
                 },
             )
         except Exception as e:
-            log.error("Failed to read/stream bundle: %s", e)
+            log.error("Failed to read/stream artifact: %s", e)
             return Response(
-                content=json.dumps({
-                    "success": False, "output": f"Failed to read bundle: {e}", "exit_code": -1,
-                }),
+                content=json.dumps({"success": False, "output": f"Failed to read artifact: {e}", "exit_code": -1}),
                 media_type="application/json",
                 status_code=500,
             )
 
-    # Normal JSON response (no binary file)
     return Response(
         content=json.dumps(_gate_response_payload(
             response_result,
-            approved=True,
-            request_id=req.id,
+            approved=req["status"] not in {"pending", "denied", "expired", "cancelled"},
+            request_id=req["id"],
             service=service,
             action=action,
+            status=req["status"],
         )),
         media_type="application/json",
     )
 
 
+@app.get("/requests")
+async def list_requests(
+    status: str = "",
+    limit: int = 50,
+    authorization: str | None = Header(None),
+) -> dict:
+    await _require_auth(authorization)
+    rows = request_store.list(status=status, limit=limit)
+    return {"success": True, "requests": [_public_request(r) for r in rows], "count": len(rows)}
+
+
+@app.get("/requests/{request_id}")
+async def request_status(request_id: str, authorization: str | None = Header(None)) -> dict:
+    await _require_auth(authorization)
+    row = request_store.get(request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found")
+    return {"success": True, "request": _public_request(row)}
+
+
+@app.get("/requests/{request_id}/artifact")
+async def request_artifact(request_id: str, authorization: str | None = Header(None)) -> Response:
+    await _require_auth(authorization)
+    row = request_store.get(request_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Request not found")
+    path = row.get("artifact_path")
+    if not path:
+        raise HTTPException(status_code=404, detail="Request has no artifact")
+    try:
+        with open(path, "rb") as f:
+            content = f.read()
+    except OSError as e:
+        raise HTTPException(status_code=404, detail=f"Artifact unavailable: {e}") from e
+    return Response(content=content, media_type="application/octet-stream")
+
+
+@app.post("/requests/{request_id}/cancel")
+async def cancel_request(request_id: str, authorization: str | None = Header(None)) -> dict:
+    await _require_auth(authorization)
+    ok = request_store.cancel(request_id)
+    if not ok:
+        raise HTTPException(status_code=409, detail="Request cannot be cancelled")
+    return {"success": True, "request_id": request_id, "status": "cancelled"}
+
+
+@app.post("/requests/expire-stale")
+async def expire_stale_requests(authorization: str | None = Header(None)) -> dict:
+    await _require_auth(authorization)
+    n = request_store.expire_stale()
+    return {"success": True, "expired": n}
+
+
 @app.get("/health")
 async def health() -> dict:
-    cnt = await request_store.count
     return {
         "status": "ok",
         "version": APP_VERSION,
-        "pending_requests": cnt,
+        "pending_requests": request_store.count_pending(),
+        "request_ttl": _request_ttl(),
+        "approval_timeout": _approval_timeout(),
         "services": list_services(),
     }
 
 
-# ── Reaper ───────────────────────────────────────────────────────────────────
+# ── Worker/Reaper ────────────────────────────────────────────────────────────
+
+def _execute_request_sync(row: dict) -> tuple[dict, str]:
+    svc = get_service(row["service"])
+    if not svc:
+        return ({"success": False, "output": f"Unknown service: {row['service']}", "exit_code": -1}, "")
+    try:
+        result = svc.execute(row["action"], row["data"], config)
+    except Exception as e:
+        log.exception("Service execution error for %s", row["id"][:16])
+        result = {"success": False, "output": f"Execution error: {e}", "exit_code": -1}
+
+    artifact_path = ""
+    source_artifact = result.pop("_binary_file", None)
+    if source_artifact:
+        dest = _artifact_dir() / f"{row['id']}.artifact"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(source_artifact, dest)
+            artifact_path = str(dest)
+        except Exception as e:
+            log.error("Failed to preserve artifact for %s: %s", row["id"][:16], e)
+            result = {"success": False, "output": f"Failed to preserve artifact: {e}", "exit_code": -1}
+    return result, artifact_path
+
+
+async def _worker_loop() -> None:
+    while True:
+        try:
+            row = request_store.claim_next_approved()
+            if not row:
+                await asyncio.sleep(1)
+                continue
+            log.info("Executing approved request %s %s/%s", row["id"][:16], row["service"], row["action"])
+            result, artifact_path = await asyncio.to_thread(_execute_request_sync, row)
+            status = "succeeded" if result.get("success") else "failed"
+            request_store.finish(row["id"], status, result, artifact_path=artifact_path)
+            log.info("Request %s finished: %s", row["id"][:16], status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning("Worker error: %s", e)
+            await asyncio.sleep(2)
+
 
 async def _reaper_loop() -> None:
     while True:
         await asyncio.sleep(30)
         try:
-            n = await request_store.reap()
+            n = request_store.expire_stale()
             if n:
-                log.info("Reaped %d expired request(s)", n)
+                log.info("Expired %d stale request(s)", n)
         except Exception as e:
             log.warning("Reaper error: %s", e)
 

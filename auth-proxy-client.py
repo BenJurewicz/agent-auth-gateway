@@ -99,23 +99,22 @@ class AuthProxyClient:
         self.auth_token = auth_token or os.environ.get("AUTH_PROXY_TOKEN", "")
         self.timeout = timeout
 
-    def _gate(self, service: str, action: str, params: dict, details: str = "") -> dict:
-        """Low-level: send a gated operation to the proxy (JSON endpoint)."""
-        url = f"{self.proxy_url}/gate/{service}/{action}"
-        body = json.dumps({"params": params, "details": details}).encode("utf-8")
-
+    def _json_request(self, method: str, path: str, body: Optional[dict] = None, timeout: Optional[int] = None) -> dict:
+        """Low-level JSON request helper."""
+        url = f"{self.proxy_url}{path}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
         req = url_request.Request(
-            url, data=body,
+            url, data=data,
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.auth_token}",
             },
-            method="POST",
+            method=method,
         )
-
         try:
-            resp = url_request.urlopen(req, timeout=self.timeout)
-            return json.loads(resp.read().decode("utf-8"))
+            resp = url_request.urlopen(req, timeout=timeout or self.timeout)
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
         except url_request.HTTPError as e:
             detail = ""
             try:
@@ -126,13 +125,21 @@ class AuthProxyClient:
         except URLError as e:
             raise AuthProxyError(f"Cannot reach proxy at {url}: {e.reason}") from e
 
-    def _gate_pull(self, service: str, action: str, params: dict, details: str = "") -> bytes:
+    def _gate(self, service: str, action: str, params: dict, details: str = "", async_request: bool = False) -> dict:
+        """Low-level: send a gated operation to the proxy (JSON endpoint)."""
+        return self._json_request(
+            "POST",
+            f"/gate/{service}/{action}",
+            {"params": params, "details": details, "async_request": async_request},
+        )
+
+    def _gate_pull(self, service: str, action: str, params: dict, details: str = "", async_request: bool = False) -> bytes:
         """Low-level: send a gated operation to the binary-download endpoint.
 
         Returns the raw bytes of the response body.
         """
         url = f"{self.proxy_url}/gate/pull/{service}/{action}"
-        body = json.dumps({"params": params, "details": details}).encode("utf-8")
+        body = json.dumps({"params": params, "details": details, "async_request": async_request}).encode("utf-8")
 
         req = url_request.Request(
             url, data=body,
@@ -373,6 +380,7 @@ class AuthProxyClient:
         workdir: str,
         branch: str = "main",
         details: str = "",
+        async_request: bool = False,
     ) -> dict:
         """Push local commits through the gateway via bundle transport.
 
@@ -447,11 +455,11 @@ class AuthProxyClient:
             "repo": repo,
             "branch": branch,
             "bundle_b64": b64,
-        }, details)
+        }, details, async_request=async_request)
 
-    def git_clear_cache(self, details: str = "") -> dict:
+    def git_clear_cache(self, details: str = "", async_request: bool = False) -> dict:
         """Clear all cached bare repos stored on the gateway."""
-        return self._gate("git", "clear-cache", {}, details)
+        return self._gate("git", "clear-cache", {}, details, async_request=async_request)
 
     # ── GitHub service ─────────────────────────────────────────────────
 
@@ -486,6 +494,7 @@ class AuthProxyClient:
         description: str = "",
         auto_init: bool = False,
         details: str = "",
+        async_request: bool = False,
     ) -> dict:
         """Create a new GitHub repository.
 
@@ -506,7 +515,7 @@ class AuthProxyClient:
             "private": str(private).lower(),
             "description": description,
             "auto_init": str(auto_init).lower(),
-        }, details)
+        }, details, async_request=async_request)
 
     def github_create_pr(
         self,
@@ -517,6 +526,7 @@ class AuthProxyClient:
         base: str = "main",
         body: str = "",
         details: str = "",
+        async_request: bool = False,
     ) -> dict:
         """Create a pull request on GitHub.
 
@@ -541,13 +551,28 @@ class AuthProxyClient:
             "head": head,
             "base": base,
             "body": body,
-        }, details)
+        }, details, async_request=async_request)
+
+    # ── Request queue ──────────────────────────────────────────────────
+
+    def request_status(self, request_id: str) -> dict:
+        return self._json_request("GET", f"/requests/{request_id}", timeout=30)
+
+    def request_list(self, status: str = "", limit: int = 50) -> dict:
+        query = f"?limit={int(limit)}" + (f"&status={status}" if status else "")
+        return self._json_request("GET", f"/requests{query}", timeout=30)
+
+    def request_cancel(self, request_id: str) -> dict:
+        return self._json_request("POST", f"/requests/{request_id}/cancel", {}, timeout=30)
+
+    def requests_expire_stale(self) -> dict:
+        return self._json_request("POST", "/requests/expire-stale", {}, timeout=30)
 
     # ── Generic gate ────────────────────────────────────────────────────
 
-    def gate(self, service: str, action: str, params: dict, details: str = "") -> dict:
+    def gate(self, service: str, action: str, params: dict, details: str = "", async_request: bool = False) -> dict:
         """Send an arbitrary gated operation. Use when no convenience method exists."""
-        return self._gate(service, action, params, details)
+        return self._gate(service, action, params, details, async_request=async_request)
 
     # ── Health ──────────────────────────────────────────────────────────
 
@@ -588,6 +613,7 @@ def cli() -> None:
     p_gate.add_argument("--param", "-p", action="append", default=[],
                         help="Key=value parameter (can be repeated)")
     p_gate.add_argument("--details", "-d", default="", help="Human-readable context")
+    p_gate.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
 
     # ── pull (binary download endpoint) ─────────────────────────────────
     p_pull = sub.add_parser("pull", help="Download a bundle via the binary endpoint")
@@ -618,6 +644,7 @@ def cli() -> None:
     p_push.add_argument("--details", "-d", default="", help="Human-readable context")
     p_push.add_argument("--timeout", type=int, default=0,
                         help="Override request timeout in seconds")
+    p_push.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
 
     # ── git clear-cache ────────────────────────────────────────────────
     p_git_clear = sub.add_parser("git-clear-cache",
@@ -626,6 +653,7 @@ def cli() -> None:
         help="Human-readable context for approval prompt")
     p_git_clear.add_argument("--timeout", type=int, default=0,
         help="Override request timeout in seconds")
+    p_git_clear.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
 
     # ── github list-repos ──────────────────────────────────────────────
     p_gh_list = sub.add_parser("github-list-repos",
@@ -647,6 +675,7 @@ def cli() -> None:
         help="Initialize with README")
     p_gh_create.add_argument("--details", "-d", default="",
         help="Human-readable context for approval prompt")
+    p_gh_create.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
 
     # ── github create-pr ───────────────────────────────────────────────
     p_gh_pr = sub.add_parser("github-create-pr",
@@ -659,6 +688,20 @@ def cli() -> None:
     p_gh_pr.add_argument("--body", default="", help="PR description body")
     p_gh_pr.add_argument("--details", "-d", default="",
         help="Human-readable context for approval prompt")
+    p_gh_pr.add_argument("--async", dest="async_request", action="store_true", help="Queue request and return immediately")
+
+    # ── request queue ───────────────────────────────────────────────────
+    p_req_status = sub.add_parser("request-status", help="Show queued request status")
+    p_req_status.add_argument("request_id")
+
+    p_req_list = sub.add_parser("requests-list", help="List queued requests")
+    p_req_list.add_argument("--status", default="", help="Filter by status")
+    p_req_list.add_argument("--limit", type=int, default=50, help="Max rows")
+
+    p_req_cancel = sub.add_parser("request-cancel", help="Cancel a pending/approved/running request")
+    p_req_cancel.add_argument("request_id")
+
+    sub.add_parser("requests-expire-stale", help="Expire stale pending/approved requests now")
 
     # ── health ──────────────────────────────────────────────────────────
     sub.add_parser("health", help="Check proxy health")
@@ -683,7 +726,7 @@ def cli() -> None:
             params[key] = val
 
         try:
-            result = client.gate(args.service, args.action, params, args.details)
+            result = client.gate(args.service, args.action, params, args.details, async_request=args.async_request)
         except AuthProxyError as e:
             print(f"ERROR: {e}", file=sys.stderr)
             sys.exit(1)
@@ -736,6 +779,7 @@ def cli() -> None:
             workdir=args.workdir,
             branch=args.branch,
             details=args.details,
+            async_request=args.async_request,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)
@@ -745,6 +789,7 @@ def cli() -> None:
         client.timeout = timeout or 600
         result = client.git_clear_cache(
             details=args.details or "Clear cached bare repos from the auth gateway",
+            async_request=args.async_request,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)
@@ -776,6 +821,7 @@ def cli() -> None:
             description=args.description,
             auto_init=args.auto_init,
             details=args.details or f"Create repo: {args.name}",
+            async_request=args.async_request,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)
@@ -790,7 +836,29 @@ def cli() -> None:
             base=args.base,
             body=args.body,
             details=args.details or f"PR: {args.title}",
+            async_request=args.async_request,
         )
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    # ── request queue ───────────────────────────────────────────────────
+    elif args.command == "request-status":
+        result = client.request_status(args.request_id)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    elif args.command == "requests-list":
+        result = client.request_list(status=args.status, limit=args.limit)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    elif args.command == "request-cancel":
+        result = client.request_cancel(args.request_id)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        sys.exit(0 if result.get("success") else 1)
+
+    elif args.command == "requests-expire-stale":
+        result = client.requests_expire_stale()
         print(json.dumps(result, indent=2, ensure_ascii=False))
         sys.exit(0 if result.get("success") else 1)
 
