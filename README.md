@@ -48,6 +48,9 @@ privileged operation.
 Only SSH git URLs are allowed (`git@github.com:user/repo.git` or `ssh://`).
 The `sudo` service only accepts commands that start with `sudo`; SSH target, user,
 port, and key are configured on the gateway and cannot be overridden by requests.
+It parses the request with `shlex`, re-quotes argv before crossing the SSH remote
+shell boundary, requires an explicit dedicated SSH key, and denies common shell-
+spawning programs by default.
 
 ## Adding a New Service
 
@@ -243,7 +246,9 @@ services:
     host: "agent-vm.example.internal"     # target machine for sudo commands
     user: "openclaw"
     port: 22
-    ssh_key_path: "~/.ssh/id_ed25519_agent_vm"
+    ssh_key_path: "~/.ssh/id_ed25519_agent_vm"  # required dedicated key
+    strict_host_key_checking: "yes"       # pre-pin target host key in known_hosts
+    denied_commands: ["sh", "bash", "zsh", "vi", "vim", "nano", "find", "xargs", "env"]
     timeout: 300
 ```
 

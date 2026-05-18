@@ -838,7 +838,7 @@ def cli() -> None:
         client.timeout = timeout or 600
         result = client.sudo_run(
             command=args.sudo_command,
-            details=args.details or f"Run sudo command: {args.sudo_command}",
+            details=args.details,
             async_request=args.async_request,
         )
         print(json.dumps(result, indent=2, ensure_ascii=False))
