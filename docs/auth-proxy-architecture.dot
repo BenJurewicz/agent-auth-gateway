@@ -1,0 +1,51 @@
+digraph AuthProxyArchitecture {
+  graph [rankdir=LR, bgcolor="white", pad="0.25", nodesep="0.65", ranksep="0.9"];
+  node [shape=box, style="rounded,filled", fillcolor="#f7f9fb", color="#5f6b7a", penwidth=1.6, fontname="Arial", fontsize=12, margin="0.14,0.10"];
+  edge [color="#34383d", fontname="Arial", fontsize=10, arrowsize=0.8];
+
+  agent [label=<
+    <B>AI Agent</B><BR/>
+    remote VM<BR ALIGN="LEFT"/>
+    • no credentials<BR ALIGN="LEFT"/>
+    • delegates operations<BR ALIGN="LEFT"/>
+    • receives results
+  >];
+
+  proxy [label=<
+    <B>Auth Proxy</B><BR/>
+    gate host<BR ALIGN="LEFT"/>
+    • holds credentials<BR ALIGN="LEFT"/>
+    • service plugin registry<BR ALIGN="LEFT"/>
+    • durable request store
+  >];
+
+  telegram [label=<
+    <B>Telegram Bot</B><BR/>
+    approval surface<BR ALIGN="LEFT"/>
+    • approve / deny<BR ALIGN="LEFT"/>
+    • authorized users only
+  >];
+
+  services [label=<
+    <B>Service Plugins</B><BR/>
+    approved execution<BR ALIGN="LEFT"/>
+    • git bundle transport<BR ALIGN="LEFT"/>
+    • GitHub API<BR ALIGN="LEFT"/>
+    • sudo over SSH
+  >];
+
+  targets [label=<
+    <B>External Targets</B><BR/>
+    credentials never leave gate<BR ALIGN="LEFT"/>
+    • GitHub<BR ALIGN="LEFT"/>
+    • agent VM / sudo target<BR ALIGN="LEFT"/>
+    • other APIs
+  >];
+
+  agent -> proxy [label="POST /gate/{service}/{action}"];
+  proxy -> agent [label="request id + status/result"];
+  proxy -> telegram [label="approval request"];
+  telegram -> proxy [label="approved / denied"];
+  proxy -> services [label="run approved action"];
+  services -> targets [label="use gate-held credentials"];
+}
